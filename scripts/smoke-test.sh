@@ -169,6 +169,18 @@ else
   sed 's/^/      /' "$jar_file" | head -10
 fi
 
+# The cookie is only useful if DSH accepts it back. Replaying it with the
+# client's own Host must not trigger another exchange; if it does, the proxy is
+# presenting a different authority than the cookie was minted for, and every
+# page load loops forever.
+second="$(curl -s -o /dev/null -D - --max-time 20 \
+  -b "$jar_file" -u "$USER_NAME:$USER_PASS" "$base/" 2>&1 || true)"
+if printf '%s' "$second" | grep -qi '^set-cookie:.*dsh-auth'; then
+  fail "second request re-issued a session cookie -- existing session was not reused"
+else
+  pass "session cookie is reused (no re-exchange on the next request)"
+fi
+
 # The cookie's payload must name the authority the CLIENT used, not the loopback
 # address upstream sees. If it says 127.0.0.1 the browser sends a cookie DSH
 # rejects, and every page load re-exchanges the token: the session never sticks.
