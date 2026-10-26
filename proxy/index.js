@@ -73,6 +73,71 @@ const AUTH_ENABLED = Boolean(AUTH_USER && AUTH_PASS);
 // console 401 noise. Pages, API routes, and WebSocket upgrades still authenticate.
 const PUBLIC_PATHS = new Set(['/manifest.webmanifest', '/favicon.svg', '/favicon.ico']);
 
+// Authorities this proxy serves. Empty means "no host check": DSH's own trust
+// fence still guards /api, and the page itself is reachable at any Host.
+//
+// DSH only applies its trust fence to /api, so the page, the asset bundles and
+// the WebSocket upgrades are served to any Host header. That is not an
+// authentication hole on its own, but it does mean a hostname pointed at this
+// server gets a working UI. When this list is set, every request -- not just
+// /api -- must match one of them.
+//
+// Loopback is always allowed. It cannot be reached by DNS rebinding, and it is
+// how the container healthcheck and the smoke test probe the proxy.
+const TRUSTED_HOSTS = new Set(
+  (process.env.DSH_TRUSTED_HOSTS || '')
+    .split(',')
+    .map((entry) => entry.trim().toLowerCase())
+    // Tolerate a pasted URL, matching entrypoint.sh's behaviour.
+    .map((entry) => (entry.includes('://') ? entry.slice(entry.indexOf('://') + 3) : entry))
+    .map((entry) => entry.split('/')[0])
+    .filter(Boolean),
+);
+
+// The allowance covers the listener itself: 127.0.0.1:<port>, localhost:<port>,
+// [::1]:<port>. Compared with any port stripped, so an unusual port is fine.
+const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '[::1]', '::1', '0.0.0.0']);
+
+function hostnameOf(hostHeader) {
+  if (!hostHeader) return '';
+  // Strip a port, keeping an IPv6 literal's brackets intact.
+  if (hostHeader.startsWith('[')) {
+    const end = hostHeader.indexOf(']');
+    return end === -1 ? hostHeader.toLowerCase() : hostHeader.slice(0, end + 1).toLowerCase();
+  }
+  return hostHeader.split(':')[0].toLowerCase();
+}
+
+// Whether a request's authority may be served at all.
+function checkHost(req) {
+  if (TRUSTED_HOSTS.size === 0) return true;
+
+  const host = String(req.headers.host || '').toLowerCase();
+  if (!host) return false;
+
+  if (LOOPBACK_HOSTNAMES.has(hostnameOf(host))) return true;
+  if (TRUSTED_HOSTS.has(host)) return true;
+
+  // A configured entry without a port also matches that host on any port; a
+  // browser adds :8080 and would otherwise be refused for it.
+  const hostname = hostnameOf(host);
+  for (const entry of TRUSTED_HOSTS) {
+    if (!entry.includes(':') && entry === hostname) return true;
+  }
+  return false;
+}
+
+function rejectHost(res) {
+  // 421 Misdirected Request: the request reached a server that does not serve
+  // this authority. It leaks less than describing the allowed set.
+  res.writeHead(421, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('421 Misdirected Request');
+}
+
+function rejectUpgradeHost(socket) {
+  socket.end('HTTP/1.1 421 Misdirected Request\r\nConnection: close\r\n\r\n');
+}
+
 function safeEqual(a, b) {
   const left = Buffer.from(String(a));
   const right = Buffer.from(String(b));
@@ -195,6 +260,14 @@ function requestPathname(rawUrl) {
 const server = http.createServer((req, res) => {
   const pathname = requestPathname(req.url);
 
+  // Host before auth: an authority this proxy does not serve gets no hint about
+  // whether credentials would have helped.
+  if (!checkHost(req)) {
+    console.warn(`[proxy] refused host ${JSON.stringify(req.headers.host)} for ${pathname}`);
+    rejectHost(res);
+    return;
+  }
+
   if (!PUBLIC_PATHS.has(pathname) && !checkAuth(req)) {
     rejectUnauthorized(res);
     return;
@@ -221,6 +294,11 @@ const server = http.createServer((req, res) => {
 });
 
 server.on('upgrade', (req, socket, head) => {
+  if (!checkHost(req)) {
+    console.warn(`[proxy] refused host ${JSON.stringify(req.headers.host)} for upgrade`);
+    rejectUpgradeHost(socket);
+    return;
+  }
   if (!checkAuth(req)) {
     rejectUpgrade(socket);
     return;
@@ -232,6 +310,11 @@ server.listen(LISTEN_PORT, LISTEN_HOST, () => {
   console.log(
     `[proxy] listening on ${LISTEN_HOST}:${LISTEN_PORT} -> ${TARGET_ORIGIN}` +
       (AUTH_ENABLED ? ' (Basic Auth enabled)' : ' (auth disabled)'),
+  );
+  console.log(
+    TRUSTED_HOSTS.size
+      ? `[proxy] serving hosts: ${[...TRUSTED_HOSTS].join(', ')} (+ loopback)`
+      : '[proxy] host check disabled (DSH_TRUSTED_HOSTS empty)',
   );
 });
 

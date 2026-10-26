@@ -133,6 +133,26 @@ base="http://127.0.0.1:${host_port}"
 code() { curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$@" || echo 000; }
 
 # --------------------------------------------------------------------------
+info "0b. Hosts outside DSH_TRUSTED_HOSTS are refused everywhere"
+
+# DSH's own fence only guards /api, so without this the page and its bundles
+# are served to any Host header. The proxy must refuse an unknown authority on
+# "/" too, not just on the API.
+c="$(code -H 'Host: not-trusted.example' -u "$USER_NAME:$USER_PASS" "$base/")"
+[ "$c" = "421" ] && pass "unknown Host on / -> 421" || fail "unknown Host on / -> $c (expected 421)"
+
+c="$(code -H 'Host: not-trusted.example' "$base/")"
+[ "$c" = "421" ] && pass "unknown Host without credentials -> 421" || fail "unknown Host without credentials -> $c (expected 421)"
+
+c="$(code -H 'Host: not-trusted.example' -u "$USER_NAME:$USER_PASS" "$base/api/directoryPicker/list")"
+[ "$c" = "421" ] && pass "unknown Host on /api -> 421" || fail "unknown Host on /api -> $c (expected 421)"
+
+# The trusted authority must still work, and loopback must stay reachable or the
+# healthcheck and everything below would fail.
+c="$(code -H "Host: $PUBLIC_AUTHORITY" -u "$USER_NAME:$USER_PASS" "$base/")"
+[ "$c" = "200" ] && pass "trusted Host on / -> 200" || fail "trusted Host on / -> $c (expected 200)"
+
+# --------------------------------------------------------------------------
 info "1. Unauthenticated request is rejected"
 c="$(code "$base/")"
 [ "$c" = "401" ] && pass "no credentials -> 401" || fail "no credentials -> $c (expected 401)"

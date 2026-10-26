@@ -75,7 +75,7 @@ docker build -t dsh-web:local --build-arg DSH_VERSION=0.2.1-rc.2 .
 | `PROXY_PORT` | `3080` | Port the proxy listens on inside the container. |
 | `PROXY_BIND` | `0.0.0.0` | Interface the proxy binds. |
 | `DSH_PORT` | `3079` | Port DSH listens on, loopback only inside the container. Must differ from `PROXY_PORT`. |
-| `DSH_TRUSTED_HOSTS` | *(empty)* | Comma-separated authorities this deployment is reached at, e.g. `app.example.com` or `app.example.com:8443`. A scheme prefix (`https://…`) is stripped with a warning, since `Host` has no scheme. The first entry doubles as the authority the session cookie is minted for. **Required whenever you reach the UI through a hostname** — see below. |
+| `DSH_TRUSTED_HOSTS` | *(empty)* | Comma-separated authorities this deployment is reached at, e.g. `app.example.com` or `app.example.com:8443`. A scheme prefix (`https://…`) is stripped with a warning, since `Host` has no scheme. When set, the proxy refuses any other Host with `421`, on every path. **Required whenever you reach the UI through a hostname** — see below. |
 | `DSH_WEB_LOG` | `/root/.dsh-web.log` | Where DSH's output goes; the proxy scrapes the launch token from here. |
 | `DSH_TOKEN` | *(empty)* | Set the launch token manually, skipping the log scrape. |
 | `DSH_TOKEN_FILE` | *(empty)* | Or read it from a file. |
@@ -122,7 +122,7 @@ that becomes a problem: the proxy talks to DSH over loopback, so DSH would mint
 a cookie for `127.0.0.1:3079`, and the browser's copy is then rejected on every
 request — the page reloads forever and the session never sticks.
 
-Two things have to agree, and one setting covers both:
+Two things have to work, and one setting covers both:
 
 ```bash
 -e DSH_TRUSTED_HOSTS=app.example.com
@@ -130,11 +130,20 @@ Two things have to agree, and one setting covers both:
 
 - It becomes `--trusted-host`, DSH's supported way to accept a non-loopback
   `Host` on `/api`. Without it the trust fence rejects the proxy.
-- Its **first** entry is also the `Host` the proxy presents upstream, so DSH
-  signs the cookie for the authority the browser actually uses.
+- The proxy also refuses any **other** Host with `421`, on every path.
 
-One variable, because the two must never disagree: a trusted authority that is
-not the one presented produces a cookie the browser cannot use.
+That second part matters: DSH applies its trust fence to `/api` only, so the
+page, its bundles and the WebSocket upgrades would otherwise be served to any
+Host header — a hostname pointed at this server would get a working UI. Listing
+the authority makes the proxy reject everything else, at `/` included.
+
+**Loopback is always allowed** (`127.0.0.1`, `localhost`, `[::1]`, any port).
+It cannot be reached by DNS rebinding, and it is how the container healthcheck
+probes the proxy.
+
+Leaving the variable empty disables the host check entirely; the UI is then
+reachable at any Host, and only `--trusted-host` is left unset. Use that only
+alongside Basic Auth on a trusted network.
 
 Include the port when it is not the scheme default: `app.example.com:8443`.
 List several accepted authorities as `a.example.com,b.example.com`; the first
