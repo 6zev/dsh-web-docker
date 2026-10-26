@@ -29,6 +29,11 @@ const LOG_FILE = process.env.DSH_WEB_LOG || '/root/.dsh-web.log';
 const TOKEN_FILE_AUTO = process.env.DSH_TOKEN_FILE_AUTO || '/root/.dsh-launch-token';
 const TOKEN_QUERY_KEY = process.env.DSH_TOKEN_QUERY_KEY || 'token';
 
+// The authority browsers use to reach this deployment, e.g. "app.example.com"
+// or "app.example.com:8443". Must match a --trusted-host value given to DSH
+// (see entrypoint.sh), otherwise /api rejects the forwarded Host.
+const PUBLIC_HOST = (process.env.DSH_PUBLIC_HOST || '').trim();
+
 const HARD_TOKEN = process.env.DSH_TOKEN || '';
 const HARD_TOKEN_FILE = process.env.DSH_TOKEN_FILE || '';
 
@@ -201,18 +206,20 @@ const FORWARD_HEADERS = [
 
 // Headers forwarded when re-issuing the root document.
 //
-// `host` is forwarded deliberately and is the whole reason the session works
-// behind this proxy. DSH derives the cookie's audience from the Host it sees
-// (`requestAudience` in browser-auth.ts reads only `headers.host`, and the same
-// file states that a forwarded header is never consulted). If we handed
-// upstream the literal `127.0.0.1:3079`, it would mint a cookie whose
-// `authority` is `127.0.0.1:3079`; the browser then uses it against
-// `example.com` and DSH rejects it on every request, so the page would
-// re-exchange the launch token forever.
+// `host` is the whole reason the session works behind this proxy. DSH derives
+// the session cookie's audience from the Host it sees: `requestAudience` in
+// browser-auth.ts reads only `headers.host` and the same file states that a
+// forwarded header is never consulted, so X-Forwarded-Host would not help.
+// Handing upstream the literal `127.0.0.1:3079` would mint a cookie whose
+// `authority` is `127.0.0.1:3079`; the browser then presents it against the
+// public hostname and DSH rejects it on every request, so the page re-exchanges
+// the launch token forever and the session never persists.
 //
-// Forwarding the client's Host makes the minted cookie carry the authority the
-// browser actually uses. The socket still goes to loopback, so this is a header
-// change only -- it does not widen what upstream listens on.
+// DSH_PUBLIC_HOST names the authority the browser actually uses; it must also
+// be passed to DSH as --trusted-host (see entrypoint.sh), because presenting a
+// non-loopback Host to /api is exactly what that flag authorizes. When it is
+// unset we fall back to the client's Host, which is correct for direct
+// localhost access and for any caller that already used the right authority.
 function pickIndexHeaders(req, dropCookie) {
   const source = req.headers || {};
   const out = { accept: '*/*', 'accept-encoding': 'identity' };
@@ -220,7 +227,9 @@ function pickIndexHeaders(req, dropCookie) {
     if (dropCookie && name === 'cookie') continue;
     if (source[name]) out[name] = source[name];
   }
-  if (source.host) out.host = source.host;
+
+  const authority = PUBLIC_HOST || source.host;
+  if (authority) out.host = authority;
   return out;
 }
 

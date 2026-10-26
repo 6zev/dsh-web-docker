@@ -23,8 +23,31 @@ cd /root
 # --host is intentionally NOT passed: DSH rejects wildcard addresses in both its
 # CLI and its webserver schema, and its loopback default is exactly what the
 # proxy needs. --no-open skips the browser launcher, which cannot work here.
-echo "[start] launching dsh web on 127.0.0.1:${DSH_PORT}"
-dsh web --port "$DSH_PORT" --no-open >"$DSH_LOG" 2>&1 &
+#
+# DSH_TRUSTED_HOSTS is a comma-separated list of the authorities this deployment
+# is reached at (e.g. "app.example.com" or "app.example.com:8443"). Each becomes
+# `--trusted-host`, which is DSH's supported way to accept a non-loopback Host
+# on /api. Without it, a proxy presenting the public hostname is rejected by the
+# trust fence even though the socket is loopback.
+DSH_ARGS="web --port ${DSH_PORT} --no-open"
+if [ -n "${DSH_TRUSTED_HOSTS:-}" ]; then
+  old_ifs="$IFS"
+  IFS=','
+  for authority in $DSH_TRUSTED_HOSTS; do
+    # Trim surrounding whitespace; an empty entry is ignored rather than
+    # forwarded, because DSH fails the whole load on a malformed authority.
+    authority="$(printf '%s' "$authority" | tr -d '[:space:]')"
+    if [ -n "$authority" ]; then
+      DSH_ARGS="$DSH_ARGS --trusted-host $authority"
+      echo "[start] trusting authority: $authority"
+    fi
+  done
+  IFS="$old_ifs"
+fi
+
+echo "[start] launching dsh ${DSH_ARGS}"
+# shellcheck disable=SC2086 -- DSH_ARGS is a deliberate word list.
+dsh $DSH_ARGS >"$DSH_LOG" 2>&1 &
 DSH_PID=$!
 
 # Mirror the log to the container output. Deliberately not `dsh ... | tee`:

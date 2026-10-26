@@ -12,6 +12,9 @@ services:
       PROXY_PASSWORD: ${PROXY_PASSWORD:-}
       DSH_PORT: ${DSH_PORT:-3079}
       PROXY_PORT: ${PROXY_PORT:-3080}
+      # Required when reaching the UI via a hostname, not localhost.
+      DSH_TRUSTED_HOSTS: ${DSH_TRUSTED_HOSTS:-}
+      DSH_PUBLIC_HOST: ${DSH_PUBLIC_HOST:-}
       DSH_TELEMETRY_DISABLED: ${DSH_TELEMETRY_DISABLED:-1}
     volumes:
       # Profiles, settings, sessions. Without this, every recreate is a fresh install.

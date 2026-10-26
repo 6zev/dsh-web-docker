@@ -59,6 +59,11 @@ fi
 # --------------------------------------------------------------------------
 info "Starting container"
 
+# A non-loopback authority is what makes the cookie assertion meaningful: if the
+# deployment authority were 127.0.0.1, a cookie minted for loopback would be
+# indistinguishable from a correct one and the test would pass either way.
+PUBLIC_AUTHORITY="dsh-smoke.test"
+
 # Every docker call gets a bound. A hung daemon or exec otherwise stalls the
 # job until the runner's global timeout, with no useful output.
 docker_run_timeout=120
@@ -66,6 +71,8 @@ if ! timeout "$docker_run_timeout" docker run -d --name "$NAME" \
   -p "127.0.0.1::3080" \
   -e PROXY_USERNAME="$USER_NAME" \
   -e PROXY_PASSWORD="$USER_PASS" \
+  -e DSH_TRUSTED_HOSTS="$PUBLIC_AUTHORITY" \
+  -e DSH_PUBLIC_HOST="$PUBLIC_AUTHORITY" \
   "$IMAGE" >/dev/null; then
   echo "docker run failed or timed out"
   docker rm -f "$NAME" >/dev/null 2>&1 || true
@@ -105,6 +112,16 @@ if [ "${health:-}" = "healthy" ]; then
 else
   fail "container did not become healthy in 150s (last: ${health:-unknown})"
   timeout 20 docker logs "$NAME" 2>&1 | tail -40 | sed 's/^/      /'
+fi
+
+# The proxy can only present a non-loopback Host if DSH was told to trust it.
+# Without this the /api fence rejects the forwarded Host and the cookie
+# assertion below would be chasing the wrong failure.
+if timeout 20 docker logs "$NAME" 2>&1 | grep -q -- "--trusted-host ${PUBLIC_AUTHORITY}"; then
+  pass "dsh started with --trusted-host ${PUBLIC_AUTHORITY}"
+else
+  fail "dsh was not given --trusted-host ${PUBLIC_AUTHORITY}"
+  timeout 20 docker logs "$NAME" 2>&1 | grep -a -- "launching dsh" | sed 's/^/      /'
 fi
 
 base="http://127.0.0.1:${host_port}"
@@ -167,11 +184,15 @@ if grep -qi 'dsh-auth' "$jar_file"; then
 
   case "$decoded" in
     *'127.0.0.1'*)
-      fail "cookie authority is loopback, not the client host -- browser session will never stick"
+      fail "cookie authority is loopback, not the deployment authority -- session will never stick"
       printf '%s\n' "$decoded" | sed 's/^/      /'
       ;;
+    *"\"authority\":\"$PUBLIC_AUTHORITY\""*)
+      pass "cookie authority is the deployment authority ($PUBLIC_AUTHORITY)"
+      ;;
     *'"authority"'*)
-      pass "cookie authority names the client host"
+      fail "cookie authority does not match the deployment authority ($PUBLIC_AUTHORITY)"
+      printf '%s\n' "$decoded" | sed 's/^/      /'
       ;;
     '')
       fail "could not decode the session cookie payload"

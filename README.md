@@ -75,6 +75,8 @@ docker build -t dsh-web:local --build-arg DSH_VERSION=0.2.1-rc.2 .
 | `PROXY_PORT` | `3080` | Port the proxy listens on inside the container. |
 | `PROXY_BIND` | `0.0.0.0` | Interface the proxy binds. |
 | `DSH_PORT` | `3079` | Port DSH listens on, loopback only inside the container. Must differ from `PROXY_PORT`. |
+| `DSH_TRUSTED_HOSTS` | *(empty)* | Comma-separated authorities this deployment is reached at, e.g. `app.example.com` or `app.example.com:8443`. Passed to DSH as `--trusted-host`. **Required whenever you reach the UI through a hostname** — see below. |
+| `DSH_PUBLIC_HOST` | *(empty)* | The authority the proxy presents to DSH when issuing the session cookie. Set it to the same value as the matching `DSH_TRUSTED_HOSTS` entry. |
 | `DSH_WEB_LOG` | `/root/.dsh-web.log` | Where DSH's output goes; the proxy scrapes the launch token from here. |
 | `DSH_TOKEN` | *(empty)* | Set the launch token manually, skipping the log scrape. |
 | `DSH_TOKEN_FILE` | *(empty)* | Or read it from a file. |
@@ -113,6 +115,30 @@ the `apt-get install` line in the `Dockerfile` if you need them; the layer is sm
 `build-essential` and `python3` are deliberate: `npm install` of a package with a
 node-gyp addon, or a `pip install` that builds from source, works out of the box.
 They cost roughly 200 MB of image size.
+
+## Reaching the UI through a hostname
+
+DSH binds the session cookie to the authority the browser uses. Behind a proxy
+that becomes a problem: the proxy talks to DSH over loopback, so DSH would mint
+a cookie for `127.0.0.1:3079`, and the browser's copy is then rejected on every
+request — the page reloads forever and the session never sticks.
+
+Two settings fix it together:
+
+```bash
+-e DSH_TRUSTED_HOSTS=app.example.com \
+-e DSH_PUBLIC_HOST=app.example.com
+```
+
+- `DSH_TRUSTED_HOSTS` becomes `--trusted-host`, DSH's supported way to accept a
+  non-loopback `Host` on `/api`. Without it the trust fence rejects the proxy.
+- `DSH_PUBLIC_HOST` is the `Host` the proxy sends upstream, so DSH signs the
+  cookie for the authority the browser actually uses.
+
+Include the port when it is not the scheme default: `app.example.com:8443`.
+
+**Both are unnecessary for `http://localhost:3080`** — loopback is already
+trusted, and the client's own Host is correct.
 
 ## Security notes
 
