@@ -29,7 +29,14 @@ cd /root
 # `--trusted-host`, which is DSH's supported way to accept a non-loopback Host
 # on /api. Without it, a proxy presenting the public hostname is rejected by the
 # trust fence even though the socket is loopback.
+#
+# The FIRST entry is also the authority the proxy presents to DSH when minting a
+# session cookie: DSH binds that cookie to the Host it sees, so the proxy must
+# speak as the authority the browser actually uses. One variable drives both
+# because they must agree -- a mismatch means a cookie the browser can never
+# use, which presents as an endless reload loop.
 DSH_ARGS="web --port ${DSH_PORT} --no-open"
+PUBLIC_AUTHORITY=""
 if [ -n "${DSH_TRUSTED_HOSTS:-}" ]; then
   old_ifs="$IFS"
   IFS=','
@@ -39,10 +46,21 @@ if [ -n "${DSH_TRUSTED_HOSTS:-}" ]; then
     authority="$(printf '%s' "$authority" | tr -d '[:space:]')"
     if [ -n "$authority" ]; then
       DSH_ARGS="$DSH_ARGS --trusted-host $authority"
+      if [ -z "$PUBLIC_AUTHORITY" ]; then
+        PUBLIC_AUTHORITY="$authority"
+      fi
       echo "[start] trusting authority: $authority"
     fi
   done
   IFS="$old_ifs"
+fi
+
+# Consumed by proxy/upstream-token.js. Empty means "use the client's Host",
+# which is correct for localhost and for any caller already on the right one.
+DSH_PUBLIC_HOST="$PUBLIC_AUTHORITY"
+export DSH_PUBLIC_HOST
+if [ -n "$PUBLIC_AUTHORITY" ]; then
+  echo "[start] serving sessions for authority: $PUBLIC_AUTHORITY"
 fi
 
 echo "[start] launching dsh ${DSH_ARGS}"

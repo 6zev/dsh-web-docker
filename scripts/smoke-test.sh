@@ -72,7 +72,6 @@ if ! timeout "$docker_run_timeout" docker run -d --name "$NAME" \
   -e PROXY_USERNAME="$USER_NAME" \
   -e PROXY_PASSWORD="$USER_PASS" \
   -e DSH_TRUSTED_HOSTS="$PUBLIC_AUTHORITY" \
-  -e DSH_PUBLIC_HOST="$PUBLIC_AUTHORITY" \
   "$IMAGE" >/dev/null; then
   echo "docker run failed or timed out"
   docker rm -f "$NAME" >/dev/null 2>&1 || true

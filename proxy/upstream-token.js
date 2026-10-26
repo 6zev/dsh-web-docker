@@ -215,11 +215,10 @@ const FORWARD_HEADERS = [
 // public hostname and DSH rejects it on every request, so the page re-exchanges
 // the launch token forever and the session never persists.
 //
-// DSH_PUBLIC_HOST names the authority the browser actually uses; it must also
-// be passed to DSH as --trusted-host (see entrypoint.sh), because presenting a
-// non-loopback Host to /api is exactly what that flag authorizes. When it is
-// unset we fall back to the client's Host, which is correct for direct
-// localhost access and for any caller that already used the right authority.
+// DSH_PUBLIC_HOST names the authority the browser actually uses. entrypoint.sh
+// derives it from the first DSH_TRUSTED_HOSTS entry, so the value that is
+// trusted and the value presented to DSH cannot drift apart. When it is unset we
+// fall back to the client's Host, which is correct for direct localhost access.
 function pickIndexHeaders(req, dropCookie) {
   const source = req.headers || {};
   const out = { accept: '*/*', 'accept-encoding': 'identity' };
