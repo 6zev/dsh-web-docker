@@ -75,7 +75,7 @@ docker build -t dsh-web:local --build-arg DSH_VERSION=0.2.1-rc.2 .
 | `PROXY_PORT` | `3080` | Port the proxy listens on inside the container. |
 | `PROXY_BIND` | `0.0.0.0` | Interface the proxy binds. |
 | `DSH_PORT` | `3079` | Port DSH listens on, loopback only inside the container. Must differ from `PROXY_PORT`. |
-| `DSH_TRUSTED_HOSTS` | *(empty)* | Comma-separated authorities this deployment is reached at, e.g. `app.example.com` or `app.example.com:8443`. The first entry doubles as the authority the session cookie is minted for. **Required whenever you reach the UI through a hostname** — see below. |
+| `DSH_TRUSTED_HOSTS` | *(empty)* | Comma-separated authorities this deployment is reached at, e.g. `app.example.com` or `app.example.com:8443`. A scheme prefix (`https://…`) is stripped with a warning, since `Host` has no scheme. The first entry doubles as the authority the session cookie is minted for. **Required whenever you reach the UI through a hostname** — see below. |
 | `DSH_WEB_LOG` | `/root/.dsh-web.log` | Where DSH's output goes; the proxy scrapes the launch token from here. |
 | `DSH_TOKEN` | *(empty)* | Set the launch token manually, skipping the log scrape. |
 | `DSH_TOKEN_FILE` | *(empty)* | Or read it from a file. |
@@ -139,6 +139,12 @@ not the one presented produces a cookie the browser cannot use.
 Include the port when it is not the scheme default: `app.example.com:8443`.
 List several accepted authorities as `a.example.com,b.example.com`; the first
 one is the one browsers should use.
+
+**Pasting a full URL works.** `https://app.example.com/` is reduced to
+`app.example.com` with a warning in the log. Do not rely on it — DSH itself
+rejects a scheme outright (its trust check parses a bare `host[:port]`), and the
+scheme is meaningless there because the check compares the `Host` header, which
+never carries one.
 
 **Not needed for `http://localhost:3080`** — loopback is already trusted, and
 the client's own Host is correct.

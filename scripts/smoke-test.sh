@@ -63,6 +63,9 @@ info "Starting container"
 # deployment authority were 127.0.0.1, a cookie minted for loopback would be
 # indistinguishable from a correct one and the test would pass either way.
 PUBLIC_AUTHORITY="dsh-smoke.test"
+# Deliberately given with a scheme: real deployments paste URLs, and the
+# entrypoint is supposed to reduce this to the bare authority DSH accepts.
+TRUSTED_INPUT="https://dsh-smoke.test/"
 
 # Every docker call gets a bound. A hung daemon or exec otherwise stalls the
 # job until the runner's global timeout, with no useful output.
@@ -71,7 +74,7 @@ if ! timeout "$docker_run_timeout" docker run -d --name "$NAME" \
   -p "127.0.0.1::3080" \
   -e PROXY_USERNAME="$USER_NAME" \
   -e PROXY_PASSWORD="$USER_PASS" \
-  -e DSH_TRUSTED_HOSTS="$PUBLIC_AUTHORITY" \
+  -e DSH_TRUSTED_HOSTS="$TRUSTED_INPUT" \
   "$IMAGE" >/dev/null; then
   echo "docker run failed or timed out"
   docker rm -f "$NAME" >/dev/null 2>&1 || true
@@ -116,8 +119,11 @@ fi
 # The proxy can only present a non-loopback Host if DSH was told to trust it.
 # Without this the /api fence rejects the forwarded Host and the cookie
 # assertion below would be chasing the wrong failure.
+#
+# The input above carries a scheme, so this also proves the entrypoint reduced
+# it to the bare authority: DSH rejects a scheme outright and would not boot.
 if timeout 20 docker logs "$NAME" 2>&1 | grep -q -- "--trusted-host ${PUBLIC_AUTHORITY}"; then
-  pass "dsh started with --trusted-host ${PUBLIC_AUTHORITY}"
+  pass "dsh started with --trusted-host ${PUBLIC_AUTHORITY} (scheme stripped)"
 else
   fail "dsh was not given --trusted-host ${PUBLIC_AUTHORITY}"
   timeout 20 docker logs "$NAME" 2>&1 | grep -a -- "launching dsh" | sed 's/^/      /'

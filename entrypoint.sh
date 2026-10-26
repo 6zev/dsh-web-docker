@@ -30,6 +30,13 @@ cd /root
 # on /api. Without it, a proxy presenting the public hostname is rejected by the
 # trust fence even though the socket is loopback.
 #
+# A web address is often written with its scheme, so a pasted
+# "https://app.example.com" is accepted here and reduced to "app.example.com"
+# with a warning. DSH itself refuses a scheme outright -- `assertTrustedAuthority`
+# in api-request-trust.ts parses the entry as a bare host[:port] and fails the
+# whole plugin load otherwise -- and a scheme never belongs there anyway, because
+# it compares the HTTP `Host` header, which carries no scheme.
+#
 # The FIRST entry is also the authority the proxy presents to DSH when minting a
 # session cookie: DSH binds that cookie to the Host it sees, so the proxy must
 # speak as the authority the browser actually uses. One variable drives both
@@ -44,13 +51,30 @@ if [ -n "${DSH_TRUSTED_HOSTS:-}" ]; then
     # Trim surrounding whitespace; an empty entry is ignored rather than
     # forwarded, because DSH fails the whole load on a malformed authority.
     authority="$(printf '%s' "$authority" | tr -d '[:space:]')"
-    if [ -n "$authority" ]; then
-      DSH_ARGS="$DSH_ARGS --trusted-host $authority"
-      if [ -z "$PUBLIC_AUTHORITY" ]; then
-        PUBLIC_AUTHORITY="$authority"
-      fi
-      echo "[start] trusting authority: $authority"
+    [ -n "$authority" ] || continue
+
+    # Strip a scheme and any trailing path, keeping host[:port].
+    case "$authority" in
+      *://*)
+        original="$authority"
+        authority="${authority#*://}"   # drop scheme://
+        authority="${authority%%/*}"    # drop any path
+        echo "[start] warning: DSH_TRUSTED_HOSTS entry '$original' carries a scheme; using authority '$authority' (Host has no scheme)"
+        ;;
+    esac
+    # A trailing slash left over from "host/" is not part of an authority.
+    authority="${authority%%/*}"
+
+    if [ -z "$authority" ]; then
+      echo "[start] warning: ignoring DSH_TRUSTED_HOSTS entry with no host" >&2
+      continue
     fi
+
+    DSH_ARGS="$DSH_ARGS --trusted-host $authority"
+    if [ -z "$PUBLIC_AUTHORITY" ]; then
+      PUBLIC_AUTHORITY="$authority"
+    fi
+    echo "[start] trusting authority: $authority"
   done
   IFS="$old_ifs"
 fi
