@@ -1,0 +1,26 @@
+services:
+  dsh:
+    image: ${DSH_IMAGE:-ghcr.io/OWNER/dsh-web:dsh-0.2.1-rc.2}
+    container_name: dsh-web
+    restart: unless-stopped
+    ports:
+      # Only the proxy is published. DSH stays on loopback inside the container.
+      - "${HOST_PORT:-3080}:3080"
+    environment:
+      # Basic Auth for the proxy. Both empty = no authentication.
+      PROXY_USERNAME: ${PROXY_USERNAME:-}
+      PROXY_PASSWORD: ${PROXY_PASSWORD:-}
+      DSH_PORT: ${DSH_PORT:-3079}
+      PROXY_PORT: ${PROXY_PORT:-3080}
+      DSH_TELEMETRY_DISABLED: ${DSH_TELEMETRY_DISABLED:-1}
+    volumes:
+      # Profiles, settings, sessions. Without this, every recreate is a fresh install.
+      - dsh-data:/root/.dsh
+      # Optional: a project directory the agent can work on. Uncomment and point
+      # it somewhere real; leave commented out if you only want the isolated home.
+      # - ${PROJECT_DIR:-./workspace}:/root/workspace
+    # Give DSH time to flush sessions instead of being killed outright.
+    stop_grace_period: 20s
+
+volumes:
+  dsh-data:

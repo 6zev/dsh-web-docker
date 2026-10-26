@@ -1,0 +1,170 @@
+name: build
+
+# Build the image, verify it actually works, and only then publish to GHCR.
+#
+# The verify step is not decorative: a build that produces an image which cannot
+# serve the UI is worse than no image, because it looks fine in the registry.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dsh_version:
+        description: "npm version of @deepseek-ai/dsh (empty = resolve dist-tags.latest)"
+        required: false
+        default: ""
+      platforms:
+        description: "Comma-separated target platforms"
+        required: true
+        default: "linux/amd64,linux/arm64"
+      push_latest:
+        description: "Publish :latest — ignored for pre-release versions"
+        required: true
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "v*"
+  schedule:
+    # Weekly: notice when upstream publishes a new DSH release.
+    - cron: "0 3 * * 1"
+  pull_request:
+    paths:
+      - Dockerfile
+      - proxy/**
+      - scripts/**
+      - entrypoint.sh
+      - .github/workflows/build.yml
+
+# Never cancel a run that is midway through publishing tags.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  # inputs.* is empty outside workflow_dispatch, so give the values that other
+  # triggers rely on an explicit fallback here rather than relying on `||`.
+  PLATFORMS: ${{ inputs.platforms || 'linux/amd64,linux/arm64' }}
+  PUSH_LATEST: ${{ inputs.push_latest || 'false' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve DSH version
+        id: version
+        env:
+          # Passed through the environment, never interpolated into the script:
+          # a workflow input is untrusted text and must not become shell code.
+          REQUESTED_VERSION: ${{ inputs.dsh_version }}
+        run: |
+          set -euo pipefail
+          version="$REQUESTED_VERSION"
+          if [ -z "$version" ]; then
+            version="$(npm view @deepseek-ai/dsh dist-tags.latest)"
+          fi
+          if [ -z "$version" ]; then
+            echo "could not resolve a DSH version" >&2
+            exit 1
+          fi
+          # Reject anything that is not a plausible semver before it is used in
+          # a tag or a build arg.
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'; then
+            echo "refusing unexpected version string: $version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          # A pre-release (containing a hyphen) must never claim :latest.
+          case "$version" in
+            *-*) echo "is_prerelease=true" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "is_prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+          echo "resolved DSH $version"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build and load amd64 only first: this is what the smoke test runs against.
+      - name: Build amd64 for verification
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: dsh-web:verify
+          build-args: |
+            DSH_VERSION=${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        run: |
+          chmod +x scripts/smoke-test.sh
+          IMAGE=dsh-web:verify ./scripts/smoke-test.sh
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tags: always the version-anchored tag, plus a commit tag for traceability.
+      # :latest only for stable versions AND only when explicitly requested.
+      - name: Compute tags
+        id: tags
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/${IMAGE_NAME}"
+          version="${{ steps.version.outputs.version }}"
+          short_sha="$(echo "${GITHUB_SHA}" | cut -c1-7)"
+
+          tags="${image}:dsh-${version}"
+          tags="${tags},${image}:dsh-${version}-${short_sha}"
+
+          if [ "${{ steps.version.outputs.is_prerelease }}" = "true" ]; then
+            echo "pre-release ${version}: not tagging :latest" >&2
+          elif [ "${PUSH_LATEST}" = "true" ]; then
+            tags="${tags},${image}:latest"
+          fi
+
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "publishing: ${tags}"
+
+      - name: Build and push multi-arch
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            DSH_VERSION=${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "### dsh-web build"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| DSH version | \`${{ steps.version.outputs.version }}\` |"
+            echo "| Pre-release | ${{ steps.version.outputs.is_prerelease }} |"
+            echo "| Platforms | \`${PLATFORMS}\` |"
+            echo "| Smoke test | passed |"
+          } >> "$GITHUB_STEP_SUMMARY"

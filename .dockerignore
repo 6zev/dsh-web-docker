@@ -1,0 +1,20 @@
+# Keep the build context to exactly what the image needs.
+.git
+.github
+.hive
+.hive2
+
+# Docs, compose and local config are not part of the image
+*.md
+compose.yml
+.env
+.env.*
+.gitignore
+.dockerignore
+
+# Scripts used by CI/local verification, not copied into the image
+scripts/
+
+# Logs and editor noise
+*.log
+.DS_Store

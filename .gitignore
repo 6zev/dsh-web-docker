@@ -1,0 +1,12 @@
+# Hive working state
+.hive/
+.hive2/
+
+# Local configuration (contains proxy credentials)
+.env
+
+# Build / run artifacts
+*.log
+
+# Editor/agent index
+.codegraph/
