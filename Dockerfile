@@ -56,22 +56,29 @@ LABEL org.opencontainers.image.title="dsh-web" \
 COPY --from=dsh-builder /usr/local/ /usr/local/
 COPY --from=dsh-builder /tmp/app_version.env /etc/dsh-version
 
-# Slim tool set: enough to work inside the container, without the weight of a
-# full toolchain (build-essential/python3 belong in the image that compiles,
-# and stay in the builder stage).
+# Tool set: enough to work inside the container, including compiling native
+# modules at runtime (npm install of a package with a node-gyp addon, pip
+# build, etc.). python3/make/g++ therefore live in the runtime stage too, not
+# only in the builder -- the cost is image size, the benefit is that a user can
+# actually build inside the container.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        build-essential \
         ca-certificates \
         curl \
         git \
         jq \
         nano \
         procps \
+        python3 \
         unzip \
         wget \
     && rm -rf /var/lib/apt/lists/* \
     && git --version \
-    && jq --version
+    && jq --version \
+    && python3 --version \
+    && make --version | head -1 \
+    && g++ --version | head -1
 
 # uv for Python tooling (MCP servers launch via `uvx`/`uv run`).
 RUN curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh \

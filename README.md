@@ -93,6 +93,27 @@ volumes:
 
 Everything else in the image is disposable. Recreating without this volume gives you a clean install.
 
+## What is in the image
+
+Base is `node:24-slim` (Debian), so `node` and `npm` come from the base.
+
+| Tool | Notes |
+|---|---|
+| `@deepseek-ai/dsh` | Pinned by the `DSH_VERSION` build arg |
+| `pnpm` | Global npm install, for plugins that expect it |
+| `uv`, `uvx` | Python package manager; MCP servers commonly launch via `uvx` |
+| `git`, `curl`, `wget` | |
+| `jq`, `procps`, `unzip`, `ca-certificates` | |
+| `nano` | |
+| `python3`, `build-essential` | `make` and `g++` included, so native modules compile inside the container |
+
+There is no `vim`, `htop`, `tmux`, `tree`, `zip`, or `openssh-client`. Add them to
+the `apt-get install` line in the `Dockerfile` if you need them; the layer is small.
+
+`build-essential` and `python3` are deliberate: `npm install` of a package with a
+node-gyp addon, or a `pip install` that builds from source, works out of the box.
+They cost roughly 200 MB of image size.
+
 ## Security notes
 
 - **The container runs as root, by design.** That is what this image was asked to do, and DSH is a coding agent — it needs to write files. It also means a compromise inside the container is a root compromise *inside the container*. Do not mount the Docker socket into it.
@@ -147,6 +168,15 @@ rather than automatically: a build moves `:latest` only when `push_latest` is se
 on a manual run. Scheduled and tag-triggered builds never move it on their own, so
 `:latest` cannot silently drift to an unreviewed release. For anything you depend
 on, pin the `dsh-<version>` tag.
+
+### Automatic updates
+
+A scheduled run every 6 hours resolves the current `@deepseek-ai/dsh` version and
+checks whether `dsh-<version>` already exists on GHCR. It exists → the run stops
+before building. It does not → the image is built, smoke tested, and published.
+
+The scheduled path never moves `:latest`. To promote a version, run the workflow
+manually with `push_latest` enabled.
 
 Published to GHCR for `linux/amd64` and `linux/arm64`.
 

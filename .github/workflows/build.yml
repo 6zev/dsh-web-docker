@@ -25,10 +25,10 @@ on:
     tags:
       - "v*"
   schedule:
-    # Upstream publishes on no fixed cadence, so check often. The
+    # Every 6 hours. Upstream publishes on no fixed cadence, and the
     # "already published" gate makes a no-op run cheap: it stops before any
     # build starts when the version on npm is already tagged on the registry.
-    - cron: "0 3 * * *"
+    - cron: "0 */6 * * *"
   pull_request:
     paths:
       - Dockerfile
