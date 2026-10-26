@@ -198,6 +198,20 @@ const FORWARD_HEADERS = [
   'sec-ch-ua-platform',
 ];
 
+// Headers forwarded when re-issuing the root document.
+//
+// `host` is forwarded deliberately and is the whole reason the session works
+// behind this proxy. DSH derives the cookie's audience from the Host it sees
+// (`requestAudience` in browser-auth.ts reads only `headers.host`, and the same
+// file states that a forwarded header is never consulted). If we handed
+// upstream the literal `127.0.0.1:3079`, it would mint a cookie whose
+// `authority` is `127.0.0.1:3079`; the browser then uses it against
+// `example.com` and DSH rejects it on every request, so the page would
+// re-exchange the launch token forever.
+//
+// Forwarding the client's Host makes the minted cookie carry the authority the
+// browser actually uses. The socket still goes to loopback, so this is a header
+// change only -- it does not widen what upstream listens on.
 function pickIndexHeaders(req, dropCookie) {
   const source = req.headers || {};
   const out = { accept: '*/*', 'accept-encoding': 'identity' };
@@ -205,6 +219,7 @@ function pickIndexHeaders(req, dropCookie) {
     if (dropCookie && name === 'cookie') continue;
     if (source[name]) out[name] = source[name];
   }
+  if (source.host) out.host = source.host;
   return out;
 }
 
@@ -261,23 +276,33 @@ async function fetchIndex(origin, headers, path) {
 
 // Relay an upstream response, preserving Set-Cookie so the browser can
 // establish its authority-scoped session.
+//
+// Header names are collected case-insensitively into one object. The fetch
+// Headers iterator already coalesces duplicate upstream entries into a single
+// comma-joined value, so appending to the same object again (as an earlier
+// version did for Content-Type) produced the header twice on the wire.
 function sendIndex(response, res, transformHtml) {
   const headers = {};
+  const seen = new Set();
+
+  const skip = new Set([
+    'content-length',
+    'content-encoding',
+    'connection',
+    'transfer-encoding',
+    'keep-alive',
+    'upgrade',
+    'set-cookie',
+  ]);
+
   for (const [key, value] of response.headers) {
     const lower = key.toLowerCase();
-    if (
-      lower === 'content-length' ||
-      lower === 'content-encoding' ||
-      lower === 'connection' ||
-      lower === 'transfer-encoding' ||
-      lower === 'keep-alive' ||
-      lower === 'upgrade' ||
-      lower === 'set-cookie'
-    ) {
-      continue;
-    }
-    headers[key] = value;
+    if (skip.has(lower) || seen.has(lower)) continue;
+    seen.add(lower);
+    // Fixed casing so the response looks the same regardless of upstream.
+    headers[lower === 'content-type' ? 'Content-Type' : key] = value;
   }
+
   headers['Cache-Control'] = headers['Cache-Control'] || 'no-store';
   if (response.setCookies.length) headers['Set-Cookie'] = response.setCookies;
 

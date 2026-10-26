@@ -147,6 +147,48 @@ else
   sed 's/^/      /' "$jar_file" | head -10
 fi
 
+# The cookie's payload must name the authority the CLIENT used, not the loopback
+# address upstream sees. If it says 127.0.0.1 the browser sends a cookie DSH
+# rejects, and every page load re-exchanges the token: the session never sticks.
+# This is the failure that only showed up behind a real hostname, so assert the
+# payload directly rather than trusting a 200.
+if grep -qi 'dsh-auth' "$jar_file"; then
+  payload="$(grep -i 'dsh-auth' "$jar_file" | awk '{print $2}' | head -1 \
+    | sed -E 's/^v1\.([^.]+)\..*/\1/' | tr '_-' '/+')"
+  # Pad and decode. seq is avoided: `seq 1 0` yields "1 0", which would append
+  # two stray '=' and corrupt a payload that needed no padding.
+  pad=$(( (4 - ${#payload} % 4) % 4 ))
+  padded="$payload"
+  while [ "$pad" -gt 0 ]; do padded="$padded="; pad=$((pad - 1)); done
+  decoded="$(printf '%s' "$padded" | base64 -d 2>/dev/null || true)"
+
+  case "$decoded" in
+    *'127.0.0.1'*)
+      fail "cookie authority is loopback, not the client host -- browser session will never stick"
+      printf '%s\n' "$decoded" | sed 's/^/      /'
+      ;;
+    *'"authority"'*)
+      pass "cookie authority names the client host"
+      ;;
+    '')
+      fail "could not decode the session cookie payload"
+      ;;
+    *)
+      fail "unexpected cookie payload"
+      printf '%s\n' "$decoded" | sed 's/^/      /'
+      ;;
+  esac
+fi
+
+# A duplicated Content-Type breaks some clients and makes the header ambiguous.
+dup_ct="$(curl -sS -D - -o /dev/null --max-time 20 -u "$USER_NAME:$USER_PASS" "$base/" \
+  | grep -ci '^content-type:' || true)"
+if [ "$dup_ct" -le 1 ]; then
+  pass "Content-Type appears once"
+else
+  fail "Content-Type appears $dup_ct times"
+fi
+
 # --------------------------------------------------------------------------
 info "4. randomUUID shim was injected"
 if grep -q 'randomUUID' "$body_file"; then
