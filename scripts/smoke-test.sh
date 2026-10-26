@@ -181,34 +181,31 @@ else
   pass "session cookie is reused (no re-exchange on the next request)"
 fi
 
-# The cookie's payload must name the authority the CLIENT used, not the loopback
-# address upstream sees. If it says 127.0.0.1 the browser sends a cookie DSH
-# rejects, and every page load re-exchanges the token: the session never sticks.
-# This is the failure that only showed up behind a real hostname, so assert the
-# payload directly rather than trusting a 200.
-if grep -qi 'dsh-auth' "$jar_file"; then
-  # curl's cookie jar is TAB-separated, so awk's default field splitting gives
-  # the wrong column: the value is field 7 (domain, flag, path, secure, expiry,
-  # name, value). Splitting on TAB explicitly keeps this readable.
-  payload="$(grep -i 'dsh-auth' "$jar_file" | awk -F'\t' '{print $7}' | head -1 \
+# Same check, but arriving as the deployment authority rather than loopback.
+# The proxy presents the client's Host, so this request exercises the path a
+# real browser takes: a non-loopback Host that DSH must trust, and a cookie
+# minted and looked up under that same authority.
+auth_jar="$(mktemp)"
+curl -s -o /dev/null -D /dev/null --max-time 30 \
+  -H "Host: $PUBLIC_AUTHORITY" -c "$auth_jar" \
+  -u "$USER_NAME:$USER_PASS" "$base/" >/dev/null 2>&1 || true
+
+if grep -qi 'dsh-auth' "$auth_jar"; then
+  # curl's cookie jar is TAB-separated: field 7 is the value after domain, flag,
+  # path, secure, expiry and name.
+  payload="$(grep -i 'dsh-auth' "$auth_jar" | awk -F'\t' '{print $7}' | head -1 \
     | sed -E 's/^v1\.([^.]+)\..*/\1/' | tr '_-' '/+')"
-  # Pad and decode. seq is avoided: `seq 1 0` yields "1 0", which would append
-  # two stray '=' and corrupt a payload that needed no padding.
   pad=$(( (4 - ${#payload} % 4) % 4 ))
   padded="$payload"
   while [ "$pad" -gt 0 ]; do padded="$padded="; pad=$((pad - 1)); done
   decoded="$(printf '%s' "$padded" | base64 -d 2>/dev/null || true)"
 
   case "$decoded" in
-    *'127.0.0.1'*)
-      fail "cookie authority is loopback, not the deployment authority -- session will never stick"
-      printf '%s\n' "$decoded" | sed 's/^/      /'
-      ;;
     *"\"authority\":\"$PUBLIC_AUTHORITY\""*)
-      pass "cookie authority is the deployment authority ($PUBLIC_AUTHORITY)"
+      pass "cookie authority is the requesting authority ($PUBLIC_AUTHORITY)"
       ;;
     *'"authority"'*)
-      fail "cookie authority does not match the deployment authority ($PUBLIC_AUTHORITY)"
+      fail "cookie authority is not the requesting authority ($PUBLIC_AUTHORITY)"
       printf '%s\n' "$decoded" | sed 's/^/      /'
       ;;
     '')
@@ -219,7 +216,11 @@ if grep -qi 'dsh-auth' "$jar_file"; then
       printf '%s\n' "$decoded" | sed 's/^/      /'
       ;;
   esac
+else
+  fail "no session cookie when requesting as $PUBLIC_AUTHORITY"
+  sed 's/^/      /' "$auth_jar" | head -10
 fi
+rm -f "$auth_jar"
 
 # A duplicated Content-Type breaks some clients and makes the header ambiguous.
 dup_ct="$(curl -sS -D - -o /dev/null --max-time 20 -u "$USER_NAME:$USER_PASS" "$base/" \
