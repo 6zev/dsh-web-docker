@@ -23,6 +23,7 @@
 'use strict';
 
 const fs = require('fs');
+const http = require('http');
 
 const LOG_FILE = process.env.DSH_WEB_LOG || '/root/.dsh-web.log';
 const TOKEN_FILE_AUTO = process.env.DSH_TOKEN_FILE_AUTO || '/root/.dsh-launch-token';
@@ -229,7 +230,7 @@ function pickIndexHeaders(req, dropCookie) {
 async function followRedirect(origin, response, baseHeaders) {
   if (response.status < 300 || response.status >= 400) return null;
 
-  const location = response.headers.get('location');
+  const location = response.headers.location;
   if (!location) return null;
 
   let target;
@@ -262,28 +263,57 @@ async function followRedirect(origin, response, baseHeaders) {
   }
 }
 
-async function fetchIndex(origin, headers, path) {
-  const url = path && path !== '/' ? origin + path : origin + '/';
-  const response = await fetch(url, { method: 'GET', headers, redirect: 'manual' });
-  const setCookies = response.headers.getSetCookie ? response.headers.getSetCookie() : [];
-  return {
-    status: response.status,
-    headers: response.headers,
-    setCookies: Array.isArray(setCookies) ? setCookies : [],
-    body: await response.text(),
-  };
+// Issue a GET to upstream, preserving a caller-supplied `Host` header.
+//
+// `fetch` cannot be used here: it silently drops a `host` entry from the
+// request headers and writes the URL's own authority instead (verified against
+// a local listener -- asking for `host: example.com` arrives as the target).
+// That matters because DSH mints the session cookie's audience from the Host it
+// receives, so a loopback Host produces a cookie the browser can never use.
+// `http.request` sends whatever Host it is given, so this path uses it.
+function fetchIndex(origin, headers, path) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(
+      path && path !== '/' ? origin + path : origin + '/',
+    );
+
+    const request = http.request(
+      {
+        protocol: target.protocol,
+        hostname: target.hostname,
+        port: target.port,
+        path: target.pathname + target.search,
+        method: 'GET',
+        headers,
+      },
+      (response) => {
+        const chunks = [];
+        response.on('data', (chunk) => chunks.push(chunk));
+        response.on('error', reject);
+        response.on('end', () => {
+          resolve({
+            status: response.statusCode || 0,
+            headers: response.headers,
+            setCookies: response.headers['set-cookie'] || [],
+            body: Buffer.concat(chunks).toString('utf8'),
+          });
+        });
+      },
+    );
+
+    request.on('error', reject);
+    request.end();
+  });
 }
 
 // Relay an upstream response, preserving Set-Cookie so the browser can
 // establish its authority-scoped session.
 //
-// Header names are collected case-insensitively into one object. The fetch
-// Headers iterator already coalesces duplicate upstream entries into a single
-// comma-joined value, so appending to the same object again (as an earlier
-// version did for Content-Type) produced the header twice on the wire.
+// Upstream headers arrive as Node's plain object (lowercased keys). One entry
+// per name is emitted, so a header can never appear twice on the wire -- an
+// earlier version appended a second Content-Type after already copying it.
 function sendIndex(response, res, transformHtml) {
   const headers = {};
-  const seen = new Set();
 
   const skip = new Set([
     'content-length',
@@ -295,21 +325,17 @@ function sendIndex(response, res, transformHtml) {
     'set-cookie',
   ]);
 
-  for (const [key, value] of response.headers) {
+  for (const key of Object.keys(response.headers)) {
     const lower = key.toLowerCase();
-    if (skip.has(lower) || seen.has(lower)) continue;
-    seen.add(lower);
-    // Fixed casing so the response looks the same regardless of upstream.
-    headers[lower === 'content-type' ? 'Content-Type' : key] = value;
+    if (skip.has(lower)) continue;
+    headers[lower === 'content-type' ? 'Content-Type' : key] = response.headers[key];
   }
 
   headers['Cache-Control'] = headers['Cache-Control'] || 'no-store';
   if (response.setCookies.length) headers['Set-Cookie'] = response.setCookies;
 
   let body = response.body;
-  const contentType = String(
-    response.headers.get ? response.headers.get('content-type') : '',
-  ).toLowerCase();
+  const contentType = String(response.headers['content-type'] || '').toLowerCase();
   if (contentType.includes('text/html') && transformHtml) body = transformHtml(body);
 
   // Empty bodies (e.g. a 303) must not claim a text/html type.
