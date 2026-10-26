@@ -47,7 +47,7 @@ docker run -d \
   -e PROXY_PASSWORD='change-me' \
   -v dsh-data:/root/.dsh \
   --restart unless-stopped \
-  ghcr.io/OWNER/dsh-web:dsh-0.2.1-rc.2
+  ghcr.io/6zev/dsh-web:dsh-0.2.1-rc.2
 ```
 
 Open <http://localhost:3080> and log in with the credentials above.
