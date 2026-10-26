@@ -140,7 +140,13 @@ IMAGE=dsh-web:local ./scripts/smoke-test.sh
 |---|---|
 | `dsh-<version>` | Pinned to a specific `@deepseek-ai/dsh` version. Use this. |
 | `dsh-<version>-<sha>` | Same build, traceable to a commit. |
-| `latest` | Only published for **stable** DSH releases, never for a pre-release. |
+| `latest` | The most recent build that was explicitly promoted. |
+
+Upstream currently ships only pre-releases, so `:latest` is promoted deliberately
+rather than automatically: a build moves `:latest` only when `push_latest` is set
+on a manual run. Scheduled and tag-triggered builds never move it on their own, so
+`:latest` cannot silently drift to an unreviewed release. For anything you depend
+on, pin the `dsh-<version>` tag.
 
 Published to GHCR for `linux/amd64` and `linux/arm64`.
 

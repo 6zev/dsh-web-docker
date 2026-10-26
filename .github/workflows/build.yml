@@ -17,10 +17,10 @@ on:
         required: true
         default: "linux/amd64,linux/arm64"
       push_latest:
-        description: "Publish :latest — ignored for pre-release versions"
+        description: "Also publish :latest (allowed for pre-releases too, since upstream ships only those)"
         required: true
         type: boolean
-        default: false
+        default: true
   push:
     tags:
       - "v*"
@@ -134,8 +134,17 @@ jobs:
           tags="${image}:dsh-${version}"
           tags="${tags},${image}:dsh-${version}-${short_sha}"
 
+          # :latest is opt-in per run (push_latest), and pre-releases are still
+          # excluded by default. Upstream ships only pre-releases right now, so
+          # the workflow_dispatch input is the switch for deliberately promoting
+          # one; a scheduled or tag-triggered build never moves :latest on its own.
           if [ "${{ steps.version.outputs.is_prerelease }}" = "true" ]; then
-            echo "pre-release ${version}: not tagging :latest" >&2
+            if [ "${PUSH_LATEST}" = "true" ]; then
+              echo "pre-release ${version}: :latest explicitly requested" >&2
+              tags="${tags},${image}:latest"
+            else
+              echo "pre-release ${version}: not tagging :latest" >&2
+            fi
           elif [ "${PUSH_LATEST}" = "true" ]; then
             tags="${tags},${image}:latest"
           fi
