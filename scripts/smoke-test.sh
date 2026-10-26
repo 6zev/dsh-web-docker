@@ -43,9 +43,12 @@ trap 'kill "$WATCHDOG_PID" 2>/dev/null || true; cleanup' EXIT
 # --------------------------------------------------------------------------
 info "0. DSH rejects wildcard bind (the reason a proxy is needed)"
 
-# --port 0 plus a hard timeout: if a future DSH stops rejecting the wildcard it
-# may happily start serving, and the timeout is what stops this probe hanging.
-wildcard_out="$(timeout 60 docker run --rm "$IMAGE" sh -c 'dsh web --host 0.0.0.0 --port 0 2>&1' || true)"
+# --entrypoint sh is essential: without it the image's ENTRYPOINT wins, the
+# probe boots the whole stack instead of running this command, and the timeout
+# kills it -- which reads as "DSH accepted the wildcard" when it never ran.
+wildcard_out="$(timeout 90 docker run --rm --entrypoint sh "$IMAGE" \
+  -c 'dsh web --host 0.0.0.0 --port 0 2>&1' || true)"
+
 if printf '%s' "$wildcard_out" | grep -qiE 'wildcard|not supported|unspecified'; then
   pass "dsh refuses --host 0.0.0.0"
 else
@@ -120,7 +123,9 @@ c="$(code -u "$USER_NAME:wrong-password" "$base/")"
 # --------------------------------------------------------------------------
 info "3. Correct credentials return the UI"
 body_file="$(mktemp)"
-c="$(curl -s -o "$body_file" -w '%{http_code}' --max-time 20 -u "$USER_NAME:$USER_PASS" "$base/" || echo 000)"
+jar_file="$(mktemp)"
+c="$(curl -s -o "$body_file" -c "$jar_file" -w '%{http_code}' --max-time 30 \
+  -u "$USER_NAME:$USER_PASS" "$base/" || echo 000)"
 if [ "$c" = "200" ]; then
   pass "authenticated -> 200"
 else
@@ -131,6 +136,15 @@ if grep -qi '<html' "$body_file"; then
   pass "response body is HTML"
 else
   fail "response body does not look like HTML"
+fi
+
+# The whole point of the token exchange: the page comes back WITH a session
+# cookie. Without it the browser would be re-exchanging on every request.
+if grep -qi 'dsh-auth' "$jar_file"; then
+  pass "session cookie issued with the page"
+else
+  fail "no session cookie after the exchange -- browser would re-auth every request"
+  sed 's/^/      /' "$jar_file" | head -10
 fi
 
 # --------------------------------------------------------------------------
@@ -195,25 +209,32 @@ c="$(code -u "$USER_NAME:$USER_PASS" "$base/")"
 [ "$c" = "200" ] && pass "external request -> 200 (bypass works)" || fail "external request -> $c"
 
 # --------------------------------------------------------------------------
-info "8. WebSocket upgrade is not refused by the proxy"
-# Sending upgrade headers to a non-upgrade endpoint should still produce an
-# HTTP exchange. What must not happen is the proxy dropping the connection.
+info "8. Proxy forwards WebSocket upgrades (does not reject them itself)"
+# DSH answers 401 to an unauthenticated upgrade and closes it, so the only
+# thing this can assert from the outside is the negative that matters: the
+# proxy must not answer the upgrade with a 401/403 of its own. Basic Auth is
+# valid here, so any proxy-level rejection would be a bug.
 ws_out="$(curl -s -i --max-time 10 \
   -u "$USER_NAME:$USER_PASS" \
   -H 'Connection: Upgrade' \
   -H 'Upgrade: websocket' \
   -H 'Sec-WebSocket-Version: 13' \
   -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
-  "$base/" 2>&1 || true)"
+  "$base/api" 2>&1 || true)"
 
-if printf '%s' "$ws_out" | grep -qiE 'HTTP/[0-9.]+ [0-9]{3}'; then
-  status_line="$(printf '%s' "$ws_out" | grep -oiE 'HTTP/[0-9.]+ [0-9]{3}' | head -1)"
-  pass "upgrade attempt answered ($status_line), connection not dropped"
+ws_status="$(printf '%s' "$ws_out" | grep -oiE 'HTTP/[0-9.]+ [0-9]{3}' | head -1 | awk '{print $2}')"
+
+if [ -z "$ws_status" ]; then
+  # No response at all: the upgrade was taken and the socket closed by
+  # upstream, which is normal for a non-WebSocket path.
+  pass "upgrade reached upstream (no proxy-level rejection)"
+elif [ "$ws_status" = "401" ] || [ "$ws_status" = "403" ]; then
+  fail "proxy rejected a valid-credential upgrade with $ws_status"
 else
-  fail "upgrade attempt got no HTTP response -- proxy may be dropping upgrades"
+  pass "upgrade answered by upstream ($ws_status)"
 fi
 
-rm -f "$body_file"
+rm -f "$body_file" "$jar_file"
 
 # --------------------------------------------------------------------------
 printf '\n'

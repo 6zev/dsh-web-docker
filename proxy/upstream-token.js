@@ -208,6 +208,45 @@ function pickIndexHeaders(req, dropCookie) {
   return out;
 }
 
+// Follow one same-origin redirect from the token exchange, carrying the session
+// cookie it just issued. Returns null (caller relays the redirect as-is) when
+// the status is not a redirect, the Location is off-origin, or the hop fails.
+async function followRedirect(origin, response, baseHeaders) {
+  if (response.status < 300 || response.status >= 400) return null;
+
+  const location = response.headers.get('location');
+  if (!location) return null;
+
+  let target;
+  try {
+    target = new URL(location, origin + '/');
+  } catch {
+    return null;
+  }
+
+  // Only same-origin hops: this proxy must never become an open redirector,
+  // and the cookie we hold is scoped to upstream anyway.
+  if (target.origin !== origin) return null;
+
+  const headers = { ...baseHeaders };
+  const cookies = response.setCookies
+    .map((entry) => String(entry).split(';')[0].trim())
+    .filter(Boolean);
+  if (cookies.length) headers.cookie = cookies.join('; ');
+
+  // Drop the credentials segment of the URL so it is not echoed back.
+  headers.referer = origin + '/';
+
+  try {
+    const page = await fetchIndex(origin, headers, target.pathname + target.search);
+    console.log(`[upstream-token] followed ${response.status} -> ${target.pathname} (${page.status})`);
+    if (page.status !== 200) return null;
+    return page;
+  } catch {
+    return null;
+  }
+}
+
 async function fetchIndex(origin, headers, path) {
   const url = path && path !== '/' ? origin + path : origin + '/';
   const response = await fetch(url, { method: 'GET', headers, redirect: 'manual' });
@@ -296,11 +335,32 @@ async function serveIndex(req, res, context) {
           console.warn(
             `[upstream-token] token exchange failed (still 401); token ${maskToken(token)} may be stale`,
           );
-        } else {
-          console.log(
-            `[upstream-token] token exchange -> ${retry.status}, ${retry.setCookies.length} cookie(s)`,
-          );
+          sendIndex(retry, res, transformHtml);
+          return true;
         }
+
+        console.log(
+          `[upstream-token] token exchange -> ${retry.status}, ${retry.setCookies.length} cookie(s)`,
+        );
+
+        // A successful exchange answers 303 to a clean URL (session is now in
+        // the Set-Cookie). Relaying that redirect to the browser works, but it
+        // costs a second round trip and makes every "$ curl /" look like a
+        // redirect. Follow it here with the cookie we were just handed, so the
+        // caller gets the real page and its session in one response.
+        const followed = await followRedirect(
+          origin,
+          retry,
+          pickIndexHeaders(req, true),
+        );
+
+        if (followed) {
+          // Cookie came from the exchange; page came from the follow-up.
+          followed.setCookies = retry.setCookies;
+          sendIndex(followed, res, transformHtml);
+          return true;
+        }
+
         sendIndex(retry, res, transformHtml);
         return true;
       }
