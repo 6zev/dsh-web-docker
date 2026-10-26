@@ -28,14 +28,24 @@ fail() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAILED=$((FAILED + 1)); }
 info() { printf '\n== %s\n' "$1"; }
 
 cleanup() {
-  docker rm -f "$NAME" >/dev/null 2>&1 || true
+  timeout 30 docker rm -f "$NAME" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
+
+# Whole-script watchdog. Individual docker calls are bounded, but a bug in this
+# script must still fail fast with a clear message instead of stalling CI until
+# the runner's global timeout kills it with no diagnostics.
+( sleep 420; echo; echo "WATCHDOG: smoke test exceeded 420s, aborting" >&2; \
+  timeout 30 docker rm -f "$NAME" >/dev/null 2>&1 || true; kill -TERM $$ 2>/dev/null || true ) &
+WATCHDOG_PID=$!
+trap 'kill "$WATCHDOG_PID" 2>/dev/null || true; cleanup' EXIT
 
 # --------------------------------------------------------------------------
 info "0. DSH rejects wildcard bind (the reason a proxy is needed)"
 
-wildcard_out="$(docker run --rm "$IMAGE" sh -c 'dsh web --host 0.0.0.0 --port 0 2>&1' || true)"
+# --port 0 plus a hard timeout: if a future DSH stops rejecting the wildcard it
+# may happily start serving, and the timeout is what stops this probe hanging.
+wildcard_out="$(timeout 60 docker run --rm "$IMAGE" sh -c 'dsh web --host 0.0.0.0 --port 0 2>&1' || true)"
 if printf '%s' "$wildcard_out" | grep -qiE 'wildcard|not supported|unspecified'; then
   pass "dsh refuses --host 0.0.0.0"
 else
@@ -46,29 +56,40 @@ fi
 # --------------------------------------------------------------------------
 info "Starting container"
 
-docker run -d --name "$NAME" \
+# Every docker call gets a bound. A hung daemon or exec otherwise stalls the
+# job until the runner's global timeout, with no useful output.
+docker_run_timeout=120
+if ! timeout "$docker_run_timeout" docker run -d --name "$NAME" \
   -p "127.0.0.1::3080" \
   -e PROXY_USERNAME="$USER_NAME" \
   -e PROXY_PASSWORD="$USER_PASS" \
-  "$IMAGE" >/dev/null || { echo "docker run failed"; exit 1; }
+  "$IMAGE" >/dev/null; then
+  echo "docker run failed or timed out"
+  docker rm -f "$NAME" >/dev/null 2>&1 || true
+  exit 1
+fi
 
 # Resolve the host port Docker picked.
-host_port="$(docker port "$NAME" 3080/tcp | head -1 | sed 's/.*://')"
+host_port="$(timeout 15 docker port "$NAME" 3080/tcp | head -1 | sed 's/.*://' || true)"
 if [ -z "$host_port" ]; then
-  echo "could not resolve mapped port"; exit 1
+  echo "could not resolve mapped port"
+  timeout 20 docker logs "$NAME" 2>&1 | tail -30 | sed 's/^/      /'
+  exit 1
 fi
 echo "  container=$NAME host_port=$host_port"
 
 # Wait for the container to report healthy (or fail fast if it exits).
+# 150s covers the 60s health start-period plus a full DSH boot.
 waited=0
 status=""
+health=""
 while [ "$waited" -lt 150 ]; do
-  status="$(docker inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null || echo missing)"
-  health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$NAME" 2>/dev/null || echo none)"
+  status="$(timeout 10 docker inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null || echo missing)"
+  health="$(timeout 10 docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$NAME" 2>/dev/null || echo none)"
 
   if [ "$status" = "exited" ] || [ "$status" = "missing" ]; then
     echo "container exited before becoming ready:"
-    docker logs "$NAME" 2>&1 | tail -40 | sed 's/^/      /'
+    timeout 20 docker logs "$NAME" 2>&1 | tail -40 | sed 's/^/      /'
     exit 1
   fi
   if [ "$health" = "healthy" ]; then break; fi
@@ -80,7 +101,7 @@ if [ "${health:-}" = "healthy" ]; then
   pass "container is healthy"
 else
   fail "container did not become healthy in 150s (last: ${health:-unknown})"
-  docker logs "$NAME" 2>&1 | tail -40 | sed 's/^/      /'
+  timeout 20 docker logs "$NAME" 2>&1 | tail -40 | sed 's/^/      /'
 fi
 
 base="http://127.0.0.1:${host_port}"
@@ -125,21 +146,34 @@ info "5. DSH binds loopback only"
 
 # 3079 = 0x0C07. /proc/net/tcp lists local_address as HEXADDR:HEXPORT.
 # 127.0.0.1 is 0100007F in the little-endian form the kernel prints.
-listen_dump="$(docker exec "$NAME" sh -c 'cat /proc/net/tcp /proc/net/tcp6 2>/dev/null' || true)"
+#
+# timeout(1) is mandatory here: without it a hung exec blocks the whole job
+# until the runner's global limit, which is how the first run stalled.
+listen_dump="$(timeout 20 docker exec "$NAME" sh -c 'cat /proc/net/tcp 2>/dev/null' || true)"
+if [ -z "$listen_dump" ]; then
+  fail "could not read /proc/net/tcp from the container"
+fi
 
-if printf '%s' "$listen_dump" | awk '{print $2}' | grep -qi ':0C07$'; then
+# Column 2 is local_address. Strip the IPv6 form down to its last 32 bits so
+# both stacks compare the same way: an IPv4mapped or all-zero v6 wildcard is
+# still a wildcard, and ::1 still ends in the loopback quad.
+addr_of() { awk 'NR>1 {print $2}' | tr 'A-F' 'a-f'; }
+
+listens_on() { addr_of <<<"$listen_dump" | grep -qxF "$1"; }
+
+if addr_of <<<"$listen_dump" | grep -q ':0c07$'; then
   pass "DSH is listening on port 3079"
 else
   fail "no listener on 3079 found -- DSH may not be running"
 fi
 
-if printf '%s' "$listen_dump" | awk '{print $2}' | grep -qiE '^0100007F:0C07$'; then
+if listens_on '0100007f:0c07'; then
   pass "DSH listens on 127.0.0.1:3079"
 else
   fail "expected a 127.0.0.1:3079 listener"
 fi
 
-if printf '%s' "$listen_dump" | awk '{print $2}' | grep -qiE '^(00000000|00000000000000000000000000000000):0C07$'; then
+if addr_of <<<"$listen_dump" | grep -qE '^(00000000|00000000000000000000000000000000|0000000000000000ffff0000):0c07$'; then
   fail "DSH is listening on a wildcard address -- the bypass assumption is broken"
 else
   pass "DSH is NOT exposed on 0.0.0.0:3079"
@@ -147,7 +181,7 @@ fi
 
 # --------------------------------------------------------------------------
 info "6. Proxy binds every interface"
-if printf '%s' "$listen_dump" | awk '{print $2}' | grep -qiE '^(00000000|00000000000000000000000000000000):0C08$'; then
+if addr_of <<<"$listen_dump" | grep -qE '^(00000000|00000000000000000000000000000000|0000000000000000ffff0000):0c08$'; then
   pass "proxy listens on 0.0.0.0:3080 inside the container"
 else
   fail "proxy is not listening on 0.0.0.0:3080"
