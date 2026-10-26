@@ -153,7 +153,10 @@ fi
 # This is the failure that only showed up behind a real hostname, so assert the
 # payload directly rather than trusting a 200.
 if grep -qi 'dsh-auth' "$jar_file"; then
-  payload="$(grep -i 'dsh-auth' "$jar_file" | awk '{print $2}' | head -1 \
+  # curl's cookie jar is TAB-separated, so awk's default field splitting gives
+  # the wrong column: the value is field 7 (domain, flag, path, secure, expiry,
+  # name, value). Splitting on TAB explicitly keeps this readable.
+  payload="$(grep -i 'dsh-auth' "$jar_file" | awk -F'\t' '{print $7}' | head -1 \
     | sed -E 's/^v1\.([^.]+)\..*/\1/' | tr '_-' '/+')"
   # Pad and decode. seq is avoided: `seq 1 0` yields "1 0", which would append
   # two stray '=' and corrupt a payload that needed no padding.
