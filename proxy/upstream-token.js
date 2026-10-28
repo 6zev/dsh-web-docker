@@ -432,9 +432,47 @@ async function serveIndex(req, res, context) {
 
       if (retry) {
         if (retry.status === 401) {
+          // The token in hand is dead -- typically a DSH restart minted a new
+          // one and this proxy is still holding the previous session's. Ask for
+          // a rescan so the next request can succeed; without this the stale
+          // token stayed cached for the life of the process and every request
+          // after a restart failed the same way.
+          const fresh = invalidateToken(token);
           console.warn(
-            `[upstream-token] token exchange failed (still 401); token ${maskToken(token)} may be stale`,
+            `[upstream-token] token exchange failed (still 401); token ${maskToken(token)} is stale` +
+              (fresh ? `, rescan found ${maskToken(fresh)}` : ', no replacement in the log yet'),
           );
+
+          if (fresh) {
+            const freshUrl = `${requestUrl}${separator}${TOKEN_QUERY_KEY}=${encodeURIComponent(fresh)}`;
+            let second = null;
+            try {
+              second = await fetchIndex(origin, pickIndexHeaders(req, true), freshUrl);
+            } catch {
+              second = null;
+            }
+            if (second) {
+              if (second.status !== 401) {
+                console.log(
+                  `[upstream-token] retry with the new token -> ${second.status}, ${second.setCookies.length} cookie(s)`,
+                );
+                const followed = await followRedirect(origin, second, pickIndexHeaders(req, true));
+                if (followed) {
+                  followed.setCookies = second.setCookies;
+                  sendIndex(followed, res, transformHtml);
+                  return true;
+                }
+                sendIndex(second, res, transformHtml);
+                return true;
+              }
+              console.warn(
+                `[upstream-token] new token ${maskToken(fresh)} also rejected; relaying 401`,
+              );
+              sendIndex(second, res, transformHtml);
+              return true;
+            }
+          }
+
           sendIndex(retry, res, transformHtml);
           return true;
         }
@@ -476,12 +514,47 @@ async function serveIndex(req, res, context) {
   return true;
 }
 
+// Called when a token is rejected. Clears the cached token so the log is read
+// again, and returns the replacement when one can be found right now.
+//
+// DSH restarts print a new `?token=` line but the proxy may hold the previous
+// one; the log is the only source of truth. Returns '' when no new token is
+// visible yet (the restart may still be booting), in which case the caller
+// relays the 401 and the next request tries again.
+function invalidateToken(stale) {
+  if (state.source === 'manual') {
+    // An operator-supplied token cannot be refreshed from the log; leave it and
+    // let the caller relay the 401 rather than pretend a rescan would help.
+    return '';
+  }
+
+  state.done = false;
+  state.token = '';
+  state.attempts = 0;
+  state.logSize = -1;
+
+  const token = scanLogOnce();
+  if (token && token !== stale) {
+    console.log('[upstream-token] rescan found a new token after a stale rejection');
+    return token;
+  }
+
+  // Same token still in the log: the new process has not printed its line yet.
+  // Keep the log size so a later call sees the append.
+  if (token) {
+    state.token = token;
+    state.done = true;
+  }
+  return '';
+}
+
 module.exports = {
   serveIndex,
   ensureToken,
   injectIntoHead,
   // Exported for tests of the restart-refresh path.
   _scanForRestart: scanForRestart,
+  _invalidateToken: invalidateToken,
   _state: state,
   _extractFromText: extractFromText,
 };

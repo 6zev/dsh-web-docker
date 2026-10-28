@@ -384,10 +384,30 @@ info "10. Health reflects a dead upstream"
 # The supervisor is stopped FIRST (it would otherwise revive dsh within
 # seconds), then dsh is killed, then the health state must leave 'healthy'.
 timeout 20 docker exec "$NAME" sh -c 'kill -STOP 1' >/dev/null 2>&1 || true
-timeout 20 docker exec "$NAME" sh -c 'kill -TERM $(pgrep -n -f "dsh web --port")' >/dev/null 2>&1 || true
+timeout 20 docker exec "$NAME" sh -c 'kill -KILL $(pgrep -n -f "dsh web --port")' >/dev/null 2>&1 || true
 
-# One full health cycle: interval 15s, so wait past it plus the timeout.
-sleep 22
+# Prove the premise before judging the healthcheck: with the supervisor frozen,
+# nothing revives dsh, and a listener on 3079 here would make the assertion below
+# meaningless.
+dsh_alive=0
+for _ in $(seq 1 10); do
+  if timeout 10 docker exec "$NAME" sh -c 'pgrep -f "dsh web --port" >/dev/null' 2>/dev/null; then
+    dsh_alive=1
+    sleep 1
+  else
+    dsh_alive=0
+    break
+  fi
+done
+if [ "$dsh_alive" = "1" ]; then
+  fail "could not stop dsh, so the health assertion cannot be checked"
+fi
+
+# Health only leaves 'healthy' after `retries` consecutive failures (4), each
+# one interval (15s) apart, so a single dead sample is not conclusive. Wait for
+# the whole verdict -- 22s was shorter than one interval plus the timeouts and
+# produced a false "still healthy".
+sleep 90
 health_after="$(timeout 10 docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$NAME" 2>/dev/null || echo none)"
 
 if [ "$health_after" = "healthy" ]; then
