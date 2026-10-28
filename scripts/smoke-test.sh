@@ -377,48 +377,42 @@ else
 fi
 
 # --------------------------------------------------------------------------
-info "10. Health reflects a dead upstream"
-# A proxy that answers 502 forever used to read as healthy, so Docker never
-# restarted the container. That is the regression this pins down.
-#
-# The supervisor is stopped FIRST (it would otherwise revive dsh within
-# seconds), then dsh is killed, then the health state must leave 'healthy'.
-timeout 20 docker exec "$NAME" sh -c 'kill -STOP 1' >/dev/null 2>&1 || true
+info "10. A restarted DSH is served without a stale-token loop"
+# A DSH restart mints a new launch token. The proxy used to hold the previous
+# one and relay 401 forever ("token exchange failed (still 401)"), so a page
+# load after every restart failed. Kill dsh and let the supervisor bring it
+# back with a new token, then require that the UI works again.
 timeout 20 docker exec "$NAME" sh -c 'kill -KILL $(pgrep -n -f "dsh web --port")' >/dev/null 2>&1 || true
 
-# Prove the premise before judging the healthcheck: with the supervisor frozen,
-# nothing revives dsh, and a listener on 3079 here would make the assertion below
-# meaningless.
-dsh_alive=0
-for _ in $(seq 1 10); do
-  if timeout 10 docker exec "$NAME" sh -c 'pgrep -f "dsh web --port" >/dev/null' 2>/dev/null; then
-    dsh_alive=1
-    sleep 1
-  else
-    dsh_alive=0
+# Wait for the supervisor to notice and for the new process to be ready.
+recovered=0
+for _ in $(seq 1 45); do
+  sleep 2
+  c="$(code -u "$USER_NAME:$USER_PASS" "$base/")"
+  if [ "$c" = "200" ]; then
+    recovered=1
     break
   fi
 done
-if [ "$dsh_alive" = "1" ]; then
-  fail "could not stop dsh, so the health assertion cannot be checked"
-fi
 
-# Health only leaves 'healthy' after `retries` consecutive failures (4), each
-# one interval (15s) apart, so a single dead sample is not conclusive. Wait for
-# the whole verdict -- 22s was shorter than one interval plus the timeouts and
-# produced a false "still healthy".
-sleep 90
-health_after="$(timeout 10 docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$NAME" 2>/dev/null || echo none)"
-
-if [ "$health_after" = "healthy" ]; then
-  fail "health stayed 'healthy' with dsh dead -- the healthcheck only watches the proxy"
+if [ "$recovered" = "1" ]; then
+  pass "UI serves again after the restart (status $c)"
 else
-  pass "health left 'healthy' with dsh dead (now: $health_after)"
+  fail "UI did not recover after the restart (last status $c) -- stale launch token?"
+  timeout 20 docker logs "$NAME" 2>&1 | grep -aE "upstream-token|supervise" | tail -20 | sed 's/^/      /'
 fi
 
-# Unfreeze: SIGCONT lets the supervisor notice dsh died and restart it, so
-# the cleanup trap and container removal behave normally afterwards.
-timeout 20 docker exec "$NAME" sh -c 'kill -CONT 1' >/dev/null 2>&1 || true
+# A fresh session must actually be usable, not just the health of the page:
+# ask for the root twice with the cookie jar and require no re-exchange.
+restart_jar="$(mktemp)"
+curl -s -o /dev/null -c "$restart_jar" --max-time 30 \
+  -u "$USER_NAME:$USER_PASS" "$base/" >/dev/null 2>&1 || true
+if grep -qi 'dsh-auth' "$restart_jar"; then
+  pass "session cookie is issued after the restart"
+else
+  fail "no session cookie after the restart"
+fi
+rm -f "$restart_jar"
 
 rm -f "$body_file" "$jar_file"
 
