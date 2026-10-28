@@ -338,6 +338,68 @@ else
   pass "upgrade answered by upstream ($ws_status)"
 fi
 
+# --------------------------------------------------------------------------
+info "9. DSH crash is recovered by the supervisor inside the container"
+# The UI's "restart DSH" (used to apply plugin changes) is a real process exit
+# upstream, and a plugin that fails to load exits the whole process. The
+# entrypoint must still be running afterwards, and DSH must come back without a
+# container restart. Killing DSH inside the container reproduces both.
+dsh_pid_before="$(timeout 20 docker exec "$NAME" sh -c 'pgrep -n -f "dsh web --port"' 2>/dev/null || true)"
+if [ -z "$dsh_pid_before" ]; then
+  fail "could not find the dsh process inside the container"
+else
+  timeout 20 docker exec "$NAME" sh -c 'kill -TERM $(pgrep -n -f "dsh web --port")' >/dev/null 2>&1 || true
+
+  recovered=0
+  for _ in $(seq 1 60); do
+    sleep 2
+    c="$(code -u "$USER_NAME:$USER_PASS" "$base/")"
+    if [ "$c" = "200" ] || [ "$c" = "401" ]; then
+      recovered=1
+      break
+    fi
+  done
+
+  if [ "$recovered" = "1" ]; then
+    pass "dsh came back after being killed (supervisor restarted it, status $c)"
+  else
+    fail "dsh did not come back within 120s after being killed"
+    timeout 20 docker logs "$NAME" 2>&1 | grep -a supervise | tail -10 | sed 's/^/      /'
+  fi
+
+  # The supervisor runs in the entrypoint shell. If the container is still up
+  # and answering, that shell survived -- which is the property this asserts.
+  if timeout 20 docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null | grep -qx true; then
+    pass "container still running through the dsh restart"
+  else
+    fail "container stopped during the dsh restart"
+  fi
+fi
+
+# --------------------------------------------------------------------------
+info "10. Health reflects a dead upstream"
+# A proxy that answers 502 forever used to read as healthy, so Docker never
+# restarted the container. That is the regression this pins down.
+#
+# The supervisor is stopped FIRST (it would otherwise revive dsh within
+# seconds), then dsh is killed, then the health state must leave 'healthy'.
+timeout 20 docker exec "$NAME" sh -c 'kill -STOP 1' >/dev/null 2>&1 || true
+timeout 20 docker exec "$NAME" sh -c 'kill -TERM $(pgrep -n -f "dsh web --port")' >/dev/null 2>&1 || true
+
+# One full health cycle: interval 15s, so wait past it plus the timeout.
+sleep 22
+health_after="$(timeout 10 docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$NAME" 2>/dev/null || echo none)"
+
+if [ "$health_after" = "healthy" ]; then
+  fail "health stayed 'healthy' with dsh dead -- the healthcheck only watches the proxy"
+else
+  pass "health left 'healthy' with dsh dead (now: $health_after)"
+fi
+
+# Unfreeze: SIGCONT lets the supervisor notice dsh died and restart it, so
+# the cleanup trap and container removal behave normally afterwards.
+timeout 20 docker exec "$NAME" sh -c 'kill -CONT 1' >/dev/null 2>&1 || true
+
 rm -f "$body_file" "$jar_file"
 
 # --------------------------------------------------------------------------

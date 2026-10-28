@@ -55,6 +55,11 @@ const state = {
   scanning: false,
   attempts: 0,
   done: false,
+  // Size of the log tail that produced `token`. A DSH restart appends to the
+  // log, so a different size means the cached token may no longer be current.
+  // Blob-filtered sparse ranges make a full re-read cheap, but tracking the
+  // size avoids the read entirely when nothing was appended.
+  logSize: -1,
 };
 
 function readTail(path, maxBytes) {
@@ -106,7 +111,18 @@ function extractFromText(text) {
   return match ? match[1] : null;
 }
 
+// Size of the log at the moment of the read, or -1 when it cannot be stat'd.
+// Compared against the previous value to detect an append (a DSH restart).
+function logSize() {
+  try {
+    return fs.statSync(LOG_FILE).size;
+  } catch {
+    return -1;
+  }
+}
+
 function scanLogOnce() {
+  const size = logSize();
   const token = extractFromText(readTail(LOG_FILE, LOG_TAIL_BYTES));
   if (!token) return null;
   const trimmed = token.trim();
@@ -118,8 +134,28 @@ function scanLogOnce() {
   state.token = trimmed;
   state.source = 'auto';
   state.done = true;
+  state.logSize = size;
   console.log(`[upstream-token] captured launch token from ${LOG_FILE} (${trimmed.length} chars)`);
   return trimmed;
+}
+
+// A DSH restart prints a new `?token=` line. When the log grew since the last
+// successful scan, re-read it: the LAST match is the newest session's token, so
+// a restart is picked up without the proxy having to observe the process.
+// Returns the new token when one was found, '' otherwise.
+function scanForRestart() {
+  const size = logSize();
+  if (size < 0 || state.logSize < 0 || size === state.logSize) return '';
+  const previous = state.token;
+  const token = scanLogOnce();
+  if (!token) {
+    state.logSize = size;
+    return '';
+  }
+  if (token !== previous) {
+    console.log('[upstream-token] log grew and the token changed; using the new launch token');
+  }
+  return token;
 }
 
 function readConfiguredToken() {
@@ -138,7 +174,16 @@ function readConfiguredToken() {
 // (DSH may still be starting). Returns '' when nothing is available; callers
 // must treat that as "skip the retry", not as an error.
 function ensureToken() {
-  if (state.done && state.token) return state.token;
+  // A cached token is not trusted blindly: DSH restarting mints a new session,
+  // and the old token then fails the exchange. Only an operator-supplied token
+  // is authoritative, because nothing in the log can invalidate it.
+  if (state.source === 'manual' && state.token) return state.token;
+
+  if (state.done && state.token) {
+    const refreshed = scanForRestart();
+    if (refreshed) return refreshed;
+    return state.token;
+  }
 
   const configured = readConfiguredToken();
   if (configured) {
@@ -435,4 +480,8 @@ module.exports = {
   serveIndex,
   ensureToken,
   injectIntoHead,
+  // Exported for tests of the restart-refresh path.
+  _scanForRestart: scanForRestart,
+  _state: state,
+  _extractFromText: extractFromText,
 };

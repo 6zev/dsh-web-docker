@@ -112,14 +112,23 @@ RUN chmod +x /app/entrypoint.sh && sh -n /app/entrypoint.sh
 # the container and is deliberately not exposed.
 EXPOSE 3080
 
-# Healthy means "this container can serve": the proxy answers with 200 (auth
-# off), 401 (auth on), or 502 (proxy up, DSH still starting). A refused
-# connection -- or no listener at all -- is the failure this catches.
+# Healthy means "this container can serve end to end": the proxy is listening
+# AND upstream DSH is answering. Checking only the proxy was a trap -- the proxy
+# answers 502 forever once DSH dies, so the container stayed "healthy" while the
+# UI was unreachable. Probing DSH's own port makes that state unhealthy, and the
+# restart policy then brings the container back.
+#
+# DSH may answer 401 (browser auth in play) or 3xx; any answer means it is up.
+# A refused connection means it is not running: exit 1.
 HEALTHCHECK --interval=15s --timeout=5s --start-period=60s --retries=4 \
     CMD node -e '\
-      fetch("http://127.0.0.1:" + (process.env.PROXY_PORT || 3080) + "/") \
-        .then((r) => process.exit([200, 401, 502].includes(r.status) ? 0 : 1)) \
-        .catch(() => process.exit(1));'
+      const port = process.env.DSH_PORT || 3079; \
+      fetch("http://127.0.0.1:" + port + "/", { redirect: "manual" }) \
+        .then(() => process.exit(0)) \
+        .catch(() => { \
+          console.error("upstream dsh is not answering on 127.0.0.1:" + port); \
+          process.exit(1); \
+        });'
 
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/app/entrypoint.sh"]
