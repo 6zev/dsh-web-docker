@@ -414,6 +414,22 @@ else
 fi
 rm -f "$restart_jar"
 
+# --------------------------------------------------------------------------
+info "11. Installed CLI tools (gh, chromium) work inside the container"
+if gh_ver="$(timeout 20 docker exec "$NAME" gh --version 2>&1 | head -1)" && [ -n "$gh_ver" ]; then
+  pass "gh works ($gh_ver)"
+else
+  fail "gh --version failed inside the container"
+fi
+
+if chromium_dom="$(timeout 30 docker exec "$NAME" chromium --headless --dump-dom about:blank 2>/dev/null)" \
+  && printf '%s' "$chromium_dom" | grep -qi '<html'; then
+  pass "chromium headless works as root"
+else
+  fail "chromium --headless --dump-dom about:blank failed inside the container"
+  timeout 30 docker exec "$NAME" chromium --headless --dump-dom about:blank 2>&1 | tail -20 | sed 's/^/      /' || true
+fi
+
 rm -f "$body_file" "$jar_file"
 
 # --------------------------------------------------------------------------

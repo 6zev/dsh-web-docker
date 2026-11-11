@@ -65,7 +65,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
+        chromium \
         curl \
+        fonts-liberation \
         git \
         jq \
         nano \
@@ -73,18 +75,36 @@ RUN apt-get update \
         python3 \
         unzip \
         wget \
+    && mkdir -p -m 755 /etc/apt/keyrings \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/* \
     && git --version \
+    && gh --version \
+    && chromium --version \
     && jq --version \
     && python3 --version \
     && make --version | head -1 \
     && g++ --version | head -1
+
+# The container runs as root by design, and Chromium refuses to start as root
+# without --no-sandbox. Debian's /usr/bin/chromium wrapper resets CHROMIUM_FLAGS
+# before sourcing /etc/chromium.d/*, so setting it here lets `chromium` run
+# directly without requiring callers to pass --no-sandbox.
+RUN printf 'if [ "$(id -u)" = "0" ]; then\n  export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --no-sandbox"\nfi\n' \
+    > /etc/chromium.d/no-sandbox
 
 # uv for Python tooling (MCP servers launch via `uvx`/`uv run`).
 RUN curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh \
     && uv --version
 
 ENV HOME=/root \
+    CHROME_BIN=/usr/bin/chromium \
     DSH_PORT=3079 \
     PROXY_PORT=3080 \
     PROXY_BIND=0.0.0.0 \

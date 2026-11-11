@@ -16,14 +16,17 @@ on:
         description: "Comma-separated target platforms"
         required: true
         default: "linux/amd64,linux/arm64"
-      push_latest:
-        description: "Also publish :latest (allowed for pre-releases too, since upstream ships only those)"
-        required: true
-        type: boolean
-        default: true
   push:
+    branches:
+      - main
     tags:
       - "v*"
+    paths:
+      - Dockerfile
+      - proxy/**
+      - scripts/**
+      - entrypoint.sh
+      - .github/workflows/build.yml
   schedule:
     # Every 6 hours. Upstream publishes on no fixed cadence, and the
     # "already published" gate makes a no-op run cheap: it stops before any
@@ -52,7 +55,6 @@ env:
   # inputs.* is empty outside workflow_dispatch, so give the values that other
   # triggers rely on an explicit fallback here rather than relying on `||`.
   PLATFORMS: ${{ inputs.platforms || 'linux/amd64,linux/arm64' }}
-  PUSH_LATEST: ${{ inputs.push_latest || 'false' }}
 
 jobs:
   build:
@@ -84,7 +86,7 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-          # A pre-release (containing a hyphen) must never claim :latest.
+          # Record whether upstream resolved to a pre-release for the job summary.
           case "$version" in
             *-*) echo "is_prerelease=true" >> "$GITHUB_OUTPUT" ;;
             *)   echo "is_prerelease=false" >> "$GITHUB_OUTPUT" ;;
@@ -103,8 +105,8 @@ jobs:
           set -euo pipefail
           version="${{ steps.version.outputs.version }}"
 
-          # Only the scheduled run skips. A manual dispatch or a v* tag is an
-          # explicit request to rebuild, even for a version already on the registry.
+          # Only the scheduled run skips. A manual dispatch, branch push, or v* tag
+          # is an explicit request to rebuild, even for a version already on the registry.
           if [ "${{ github.event_name }}" != "schedule" ]; then
             echo "skip=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -169,11 +171,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Tags: always the version-anchored tag, plus a commit tag for traceability.
-      # :latest only when explicitly requested.
+      # Tags: always publish the version-anchored tag, commit tag, and :latest.
       - name: Compute tags
         id: tags
-        if: steps.check.outputs.skip != 'true'
+        if: github.event_name != 'pull_request' && steps.check.outputs.skip != 'true'
         run: |
           set -euo pipefail
           image="${REGISTRY}/${IMAGE_NAME}"
@@ -182,21 +183,7 @@ jobs:
 
           tags="${image}:dsh-${version}"
           tags="${tags},${image}:dsh-${version}-${short_sha}"
-
-          # :latest is opt-in per run (push_latest), and pre-releases are still
-          # excluded by default. Upstream ships only pre-releases right now, so
-          # the workflow_dispatch input is the switch for deliberately promoting
-          # one; a scheduled or tag-triggered build never moves :latest on its own.
-          if [ "${{ steps.version.outputs.is_prerelease }}" = "true" ]; then
-            if [ "${PUSH_LATEST}" = "true" ]; then
-              echo "pre-release ${version}: :latest explicitly requested" >&2
-              tags="${tags},${image}:latest"
-            else
-              echo "pre-release ${version}: not tagging :latest" >&2
-            fi
-          elif [ "${PUSH_LATEST}" = "true" ]; then
-            tags="${tags},${image}:latest"
-          fi
+          tags="${tags},${image}:latest"
 
           echo "tags=${tags}" >> "$GITHUB_OUTPUT"
           echo "publishing: ${tags}"

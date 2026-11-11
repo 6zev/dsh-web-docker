@@ -103,7 +103,8 @@ Base is `node:24-slim` (Debian), so `node` and `npm` come from the base.
 | `@deepseek-ai/dsh` | Pinned by the `DSH_VERSION` build arg |
 | `pnpm` | Global npm install, for plugins that expect it |
 | `uv`, `uvx` | Python package manager; MCP servers commonly launch via `uvx` |
-| `git`, `curl`, `wget` | |
+| `git`, `gh`, `curl`, `wget` | `gh` comes from GitHub's official apt repository |
+| `chromium` | Headless/CLI Chromium with `fonts-liberation` and root `--no-sandbox` via `/etc/chromium.d/no-sandbox` |
 | `jq`, `procps`, `unzip`, `ca-certificates` | |
 | `nano` | |
 | `python3`, `build-essential` | `make` and `g++` included, so native modules compile inside the container |
@@ -203,24 +204,18 @@ IMAGE=dsh-web:local ./scripts/smoke-test.sh
 
 | Tag | Meaning |
 |---|---|
-| `dsh-<version>` | Pinned to a specific `@deepseek-ai/dsh` version. Use this. |
+| `dsh-<version>` | Pinned to a specific `@deepseek-ai/dsh` version. Use this if you want a pinned version. |
 | `dsh-<version>-<sha>` | Same build, traceable to a commit. |
-| `latest` | The most recent build that was explicitly promoted. |
+| `latest` | Automatically updated to the most recent smoke-tested build. |
 
-Upstream currently ships only pre-releases, so `:latest` is promoted deliberately
-rather than automatically: a build moves `:latest` only when `push_latest` is set
-on a manual run. Scheduled and tag-triggered builds never move it on their own, so
-`:latest` cannot silently drift to an unreviewed release. For anything you depend
-on, pin the `dsh-<version>` tag.
+Every published build (from pushes to `main`, `v*` tags, scheduled upstream checks, or manual dispatches) updates `:latest` automatically after passing the smoke test. For pinned deployments, use a `dsh-<version>` tag.
 
 ### Automatic updates
 
 A scheduled run every 6 hours resolves the current `@deepseek-ai/dsh` version and
 checks whether `dsh-<version>` already exists on GHCR. It exists → the run stops
-before building. It does not → the image is built, smoke tested, and published.
-
-The scheduled path never moves `:latest`. To promote a version, run the workflow
-manually with `push_latest` enabled.
+before building. It does not → the image is built, smoke tested, and published
+with `dsh-<version>`, `dsh-<version>-<sha>`, and `:latest`.
 
 Published to GHCR for `linux/amd64` and `linux/arm64`.
 
