@@ -1,6 +1,6 @@
 services:
   dsh:
-    image: ${DSH_IMAGE:-ghcr.io/6zev/dsh-web:dsh-0.2.1-rc.2}
+    image: ${DSH_IMAGE:-ghcr.io/6zev/dsh-web:dsh-0.2.2-rc.5}
     container_name: dsh-web
     restart: unless-stopped
     ports:
@@ -14,6 +14,11 @@ services:
       PROXY_PORT: ${PROXY_PORT:-3080}
       # Required when reaching the UI via a hostname, not localhost.
       DSH_TRUSTED_HOSTS: ${DSH_TRUSTED_HOSTS:-}
+      # Advertised browser-facing root (--public-url). Derived from the first
+      # trusted host as https://<host>/ when empty; see README (Cloudflare).
+      DSH_PUBLIC_URL: ${DSH_PUBLIC_URL:-}
+      # WebSocket heartbeat to survive Cloudflare/Traefik idle timeouts.
+      PROXY_WS_PING_INTERVAL_MS: ${PROXY_WS_PING_INTERVAL_MS:-30000}
       DSH_TELEMETRY_DISABLED: ${DSH_TELEMETRY_DISABLED:-1}
     volumes:
       # Profiles, settings, sessions. Without this, every recreate is a fresh install.

@@ -20,7 +20,7 @@
 ARG NODE_IMAGE=node:24-slim
 # Pinned, never `@latest`: a floating tag makes builds unreproducible and can
 # silently move the image to an unreviewed release. CI resolves and overrides it.
-ARG DSH_VERSION=0.2.1-rc.2
+ARG DSH_VERSION=0.2.2-rc.5
 
 # ── Stage 1: install DSH and compile native modules ────────────────────────
 FROM ${NODE_IMAGE} AS dsh-builder

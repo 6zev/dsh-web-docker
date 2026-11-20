@@ -47,7 +47,7 @@ docker run -d \
   -e PROXY_PASSWORD='change-me' \
   -v dsh-data:/root/.dsh \
   --restart unless-stopped \
-  ghcr.io/6zev/dsh-web:dsh-0.2.1-rc.2
+  ghcr.io/6zev/dsh-web:dsh-0.2.2-rc.5
 ```
 
 Open <http://localhost:3080> and log in with the credentials above.
@@ -62,7 +62,7 @@ docker compose up -d
 ### Build it yourself
 
 ```bash
-docker build -t dsh-web:local --build-arg DSH_VERSION=0.2.1-rc.2 .
+docker build -t dsh-web:local --build-arg DSH_VERSION=0.2.2-rc.5 .
 ./scripts/smoke-test.sh IMAGE=dsh-web:local
 ```
 
@@ -76,9 +76,11 @@ docker build -t dsh-web:local --build-arg DSH_VERSION=0.2.1-rc.2 .
 | `PROXY_BIND` | `0.0.0.0` | Interface the proxy binds. |
 | `DSH_PORT` | `3079` | Port DSH listens on, loopback only inside the container. Must differ from `PROXY_PORT`. |
 | `DSH_TRUSTED_HOSTS` | *(empty)* | Comma-separated authorities this deployment is reached at, e.g. `app.example.com` or `app.example.com:8443`. A scheme prefix (`https://…`) is stripped with a warning, since `Host` has no scheme. When set, the proxy refuses any other Host with `421`, on every path. **Required whenever you reach the UI through a hostname** — see below. |
+| `DSH_PUBLIC_URL` | *(derived)* | Advertised browser-facing root, e.g. `https://app.example.com/`. Passed to dsh as `--public-url`. **Required behind any reverse proxy (Cloudflare, Traefik, nginx)** — without it dsh advertises its loopback URL and the browser-side channel tries to reach `127.0.0.1` from your machine, so the UI reconnects forever. When empty it is derived as `https://<first DSH_TRUSTED_HOSTS entry>/`; set it explicitly for http, a non-standard port, or a mount prefix. Its authority is also added to `--trusted-host` automatically. `--public-url` only advertises; it grants no trust. |
+| `PROXY_WS_PING_INTERVAL_MS` | `30000` | WebSocket heartbeat, in ms. DSH sends no ping frames, so Cloudflare (~100s) and Traefik/nginx (~60s) reap an idle realtime channel and the UI reconnects. The proxy sends a WS ping every interval to keep the channel alive. `0` disables it. |
 | `DSH_WEB_LOG` | `/root/.dsh-web.log` | Where DSH's output goes; the proxy scrapes the launch token from here. |
-| `DSH_TOKEN` | *(empty)* | Set the launch token manually, skipping the log scrape. |
-| `DSH_TOKEN_FILE` | *(empty)* | Or read it from a file. |
+| `DSH_TOKEN` | *(empty)* | **Does not set dsh's token, and should normally be left empty.** Upstream has no `--token` flag: dsh mints a fresh random 32-byte launch token per process and prints it in the `dsh web:` line. The proxy scrapes that token from the dsh log, which is the only source of truth. A value set here used to be tried forever while dsh minted a different token, so every request answered 401; it is now only a fallback for the window before dsh prints its first launch line, and it is never trusted over a log-scraped token. |
+| `DSH_TOKEN_FILE` | *(empty)* | Same as `DSH_TOKEN`, read from a file. Same caveat. |
 | `DSH_TELEMETRY_DISABLED` | `1` | Any non-empty value opts out of DSH telemetry. |
 
 Only port **3080** is exposed. DSH's own port is never published — do not add a mapping for `3079`.
@@ -159,6 +161,32 @@ never carries one.
 **Not needed for `http://localhost:3080`** — loopback is already trusted, and
 the client's own Host is correct.
 
+### Behind Cloudflare (proxied DNS)
+
+A Cloudflare-proxied host needs three things, and missing any one of them
+looks like a reconnect loop:
+
+1. **`DSH_PUBLIC_URL=https://<your domain>/` and `DSH_TRUSTED_HOSTS=<your domain>`**
+   (or just the trusted host — the public URL is derived from it as `https://…/`).
+   `--public-url` is what tells dsh where the UI lives; `--trusted-host` only
+   admits the Host. Without the public URL dsh advertises `http://127.0.0.1:3079/`
+   and the realtime channel tries to reach loopback from your browser.
+2. **Cloudflare dashboard, for this hostname:** turn **Rocket Loader off**
+   (it defers the `randomUUID` shim, so RPC ids are never created — the shim
+   now also carries `data-cfasync="false"` as a second line of defence),
+   **Auto Minify off** for HTML/JS, and a **Cache Rule: Bypass** for the host
+   (a cached `/` would serve a page without its session cookie). Leave
+   **WebSockets on**, and use **SSL Full (Strict)** if Traefik terminates TLS.
+3. **Expect a reconnect after a long idle period, not a continuous one.**
+   Cloudflare reaps an idle WebSocket after ~100s and DSH sends no pings, so
+   the proxy now sends a WS ping every 30s (`PROXY_WS_PING_INTERVAL_MS`).
+   If the UI reconnects *immediately and continuously*, it is not the idle
+   timeout — open browser DevTools → Network → WS and check the failure:
+   `403` means the Host is not trusted (`DSH_TRUSTED_HOSTS`), `401` means the
+   launch-token exchange failed (check `docker logs` for `[upstream-token]`),
+   and a `101` that closes at once usually means Traefik/Cloudflare is not
+   forwarding the `Upgrade` headers.
+
 ## Security notes
 
 - **The container runs as root, by design.** That is what this image was asked to do, and DSH is a coding agent — it needs to write files. It also means a compromise inside the container is a root compromise *inside the container*. Do not mount the Docker socket into it.
@@ -185,6 +213,21 @@ Expected. Cookies are bound to `host:port`, so `localhost:3080` and `192.168.1.5
 
 **`502 Bad Gateway`.**
 The proxy is up but DSH is not answering yet, or has exited. Check `docker logs dsh-web` — the entrypoint prints DSH's last 40 log lines when it fails to start.
+
+**`listen EADDRINUSE: address already in use 127.0.0.1:3079` after a plugin restart.**
+The old dsh process exited, but one of its children inherited the listening
+socket and kept the port bound, so the supervisor's next dsh died the same way
+on every retry. The entrypoint now starts dsh in its own process group
+(`setsid`), kills the whole tree plus any leftover dsh process on restart,
+and waits until the port is actually free before starting the next one — it
+never boots into an occupied port. If you still see this loop, the holder is
+outside the container's process tree: check `ss -ltnp` on the host for
+something else listening on 3079.
+
+**`tail: /root/.dsh-web.log: file truncated` in the container log.**
+Harmless: the supervisor truncates the log on every dsh restart so a stale
+launch token can never be read as the current one, and `tail -F` reports the
+truncation. Its stderr is now suppressed; the dsh output itself is unaffected.
 
 ## Development
 

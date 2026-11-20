@@ -180,8 +180,12 @@ function rejectUpgrade(socket) {
 
 // The shim must survive a non-secure context, so it builds ids from
 // getRandomValues (available outside secure contexts) rather than randomUUID.
+// `data-cfasync="false"` keeps Cloudflare Rocket Loader from deferring this
+// inline script: if the shim runs after the dsh bundle, the bundle already
+// called crypto.randomUUID, RPC ids never get created, and the realtime
+// channel stays pending / reconnects forever behind the Cloudflare proxy.
 const RANDOM_UUID_POLYFILL =
-  '<script>(function(){try{' +
+  '<script data-cfasync="false">(function(){try{' +
   'if(typeof crypto!=="undefined"&&crypto&&typeof crypto.randomUUID!=="function"){' +
   'crypto.randomUUID=function(){' +
   'var b=crypto.getRandomValues(new Uint8Array(16));' +
@@ -222,6 +226,39 @@ proxy.on('error', (err, req, res) => {
     res.destroy();
   }
 });
+
+// WebSocket heartbeat (Cloudflare idle-timeout fix).
+//
+// DSH's realtime channel sends no ping frames, so an idle WebSocket has no
+// protocol traffic and the first reverse proxy in the path reaps it:
+// Cloudflare ~100s, Traefik/nginx ~60s. The client then reconnects, and an
+// idle UI looks like a reconnect loop. The proxy is the only hop that can
+// fix this without touching upstream: every PROXY_WS_PING_INTERVAL_MS it
+// writes a standards-compliant WS ping frame (FIN + opcode 9, empty payload,
+// unmasked -- this side is the server to the browser) down the client socket.
+// The browser auto-replies with a pong, so both legs (browser <-> Cloudflare
+// and Cloudflare <-> origin) see traffic and stay alive. Set to 0 to disable.
+const WS_PING_INTERVAL_MS = Number(process.env.PROXY_WS_PING_INTERVAL_MS || '30000');
+
+function startWsHeartbeat(socket) {
+  if (!WS_PING_INTERVAL_MS || WS_PING_INTERVAL_MS <= 0) return () => {};
+  const timer = setInterval(() => {
+    if (socket.destroyed || !socket.writable) {
+      clearInterval(timer);
+      return;
+    }
+    try {
+      socket.write(Buffer.from([0x89, 0x00]));
+    } catch {
+      clearInterval(timer);
+    }
+  }, WS_PING_INTERVAL_MS);
+  if (typeof timer.unref === 'function') timer.unref();
+  const stop = () => clearInterval(timer);
+  socket.on('close', stop);
+  socket.on('error', stop);
+  return stop;
+}
 
 proxy.on('proxyRes', (proxyRes, req, res) => {
   const contentType = String(proxyRes.headers['content-type'] || '');
@@ -304,6 +341,10 @@ server.on('upgrade', (req, socket, head) => {
     return;
   }
   proxy.ws(req, socket, head);
+  // Keep the WebSocket alive through Cloudflare/Traefik idle timeouts; see
+  // startWsHeartbeat above. Without this an idle channel is reaped after
+  // ~100s and the UI reconnects in a loop.
+  startWsHeartbeat(socket);
 });
 
 server.listen(LISTEN_PORT, LISTEN_HOST, () => {
