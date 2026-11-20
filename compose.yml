@@ -1,6 +1,6 @@
 services:
   dsh:
-    image: ${DSH_IMAGE:-ghcr.io/6zev/dsh-web:dsh-0.2.2-rc.5}
+    image: ${DSH_IMAGE:-ghcr.io/6zev/dsh-web-docker:dsh-0.2.2-rc.5}
     container_name: dsh-web
     restart: unless-stopped
     ports:
