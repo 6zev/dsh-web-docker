@@ -29,24 +29,12 @@ const LOG_FILE = process.env.DSH_WEB_LOG || '/root/.dsh-web.log';
 const TOKEN_FILE_AUTO = process.env.DSH_TOKEN_FILE_AUTO || '/root/.dsh-launch-token';
 const TOKEN_QUERY_KEY = process.env.DSH_TOKEN_QUERY_KEY || 'token';
 
-const HARD_TOKEN = process.env.DSH_TOKEN || '';
-const HARD_TOKEN_FILE = process.env.DSH_TOKEN_FILE || '';
-
-// DSH_TOKEN cannot set the launch token: upstream has no --token flag and
-// mints a fresh random 32-byte token per process (browser-auth.ts,
-// `processLaunchToken`), printed in the `dsh web:` startup line. Passing a
-// value here used to make the proxy try that value forever while dsh kept
-// minting a different one, so every root request answered 401. The value is
-// now only a last-resort fallback when the log has no token yet, and it is
-// never trusted over a token scraped from the log.
-if (HARD_TOKEN || HARD_TOKEN_FILE) {
-  console.warn(
-    '[upstream-token] DSH_TOKEN/DSH_TOKEN_FILE cannot set dsh\'s launch token ' +
-      '(upstream has no --token flag; it mints a random token per process). ' +
-      'The proxy scrapes the token from the dsh log instead; remove the variable ' +
-      'unless you need it as a fallback while dsh is still booting.',
-  );
-}
+// NOTE: there used to be DSH_TOKEN / DSH_TOKEN_FILE variables here. They were
+// removed: they could never set dsh's launch token (upstream has no --token
+// flag; it mints a fresh random 32-byte token per process), and a value set
+// there was tried forever while dsh minted a different token, so every root
+// request answered 401. The log scrape below is the only source of truth.
+// Setting DSH_TOKEN now does nothing.
 
 let customPattern = null;
 if (process.env.DSH_LAUNCH_TOKEN_PATTERN) {
@@ -179,28 +167,13 @@ function scanForRestart() {
   return token;
 }
 
-function readConfiguredToken() {
-  if (HARD_TOKEN) return HARD_TOKEN;
-  if (HARD_TOKEN_FILE) {
-    try {
-      return fs.readFileSync(HARD_TOKEN_FILE, 'utf8').trim();
-    } catch {
-      return '';
-    }
-  }
-  return '';
-}
-
 // Resolve the token, polling the log in the background if it is not there yet
 // (DSH may still be starting). Returns '' when nothing is available; callers
 // must treat that as "skip the retry", not as an error.
 //
-// Order matters, and it used to be wrong: a configured DSH_TOKEN was returned
-// before the log was ever read, and marked `manual` so it was never
-// invalidated. DSH mints a new random token on every (re)start, so that value
-// went stale at the first restart and the proxy relayed 401 forever. The log
-// is now the source of truth on every call; a configured token is only a
-// fallback for the window before dsh prints its first launch line.
+// The log is the only source of truth: DSH mints a new random token on every
+// (re)start, so any configured value would go stale at the first restart and
+// the proxy would relay 401 forever (that is why DSH_TOKEN was removed).
 function ensureToken() {
   // A restart prints a new `?token=` line; the LAST match in the log wins.
   const fromLog = scanLogOnce();
@@ -208,16 +181,8 @@ function ensureToken() {
 
   // Log has no token yet (still booting, or the log was just truncated for a
   // restart). A cached log token may still be the current one, so keep it
-  // until a newer one appears; only then fall through to the fallback.
+  // until a newer one appears.
   if (state.source === 'auto' && state.token) return state.token;
-
-  const configured = readConfiguredToken();
-  if (configured) {
-    state.token = configured;
-    state.source = 'manual';
-    state.done = true;
-    return configured;
-  }
 
   if (state.scanning) return state.token;
   if (state.attempts >= MAX_SCAN_ATTEMPTS) {
@@ -556,9 +521,7 @@ async function serveIndex(req, res, context) {
 // visible yet (the restart may still be booting), in which case the caller
 // relays the 401 and the next request tries again.
 function invalidateToken(stale) {
-  // No exception for a configured token: a DSH_TOKEN value is not something
-  // dsh ever used (it mints its own), so a rejection means the log must be
-  // re-read, not that the manual value should be retried forever.
+  // A rejection means the log must be re-read for the current process's token.
   state.done = false;
   state.token = '';
   state.attempts = 0;
