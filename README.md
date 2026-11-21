@@ -77,7 +77,8 @@ docker build -t dsh-web:local --build-arg DSH_VERSION=0.2.2-rc.5 .
 | `DSH_PORT` | `3079` | Port DSH listens on, loopback only inside the container. Must differ from `PROXY_PORT`. |
 | `DSH_TRUSTED_HOSTS` | *(empty)* | Comma-separated authorities this deployment is reached at, e.g. `app.example.com` or `app.example.com:8443`. A scheme prefix (`https://…`) is stripped with a warning, since `Host` has no scheme. When set, the proxy refuses any other Host with `421`, on every path. **Required whenever you reach the UI through a hostname** — see below. |
 | `DSH_PUBLIC_URL` | *(derived)* | Advertised browser-facing root, e.g. `https://app.example.com/`. Passed to dsh as `--public-url`. **Required behind any reverse proxy (Cloudflare, Traefik, nginx)** — without it dsh advertises its loopback URL and the browser-side channel tries to reach `127.0.0.1` from your machine, so the UI reconnects forever. When empty it is derived as `https://<first DSH_TRUSTED_HOSTS entry>/`; set it explicitly for http, a non-standard port, or a mount prefix. Its authority is also added to `--trusted-host` automatically. `--public-url` only advertises; it grants no trust. |
-| `PROXY_WS_PING_INTERVAL_MS` | `30000` | WebSocket heartbeat, in ms. DSH sends no ping frames, so Cloudflare (~100s) and Traefik/nginx (~60s) reap an idle realtime channel and the UI reconnects. The proxy sends a WS ping every interval to keep the channel alive. `0` disables it. |
+| `PROXY_WS_PING_INTERVAL_MS` | `30000` | Downstream WebSocket ping, in ms. Cloudflare (~100s) and Traefik/nginx (~60s) reap an idle realtime channel, so the proxy sends a WS ping to the browser every interval to keep the channel alive. `0` disables it. This is *not* what fixes the continuous reconnect — see `PROXY_WS_UPSTREAM_PONG_INTERVAL_MS`. |
+| `PROXY_WS_UPSTREAM_PONG_INTERVAL_MS` | `1500` | Upstream WebSocket pong, in ms. dsh's realtime server pings every 2s and kills the socket after 2 missed pongs, so an idle UI behind Cloudflare reconnects every ~6s. The proxy answers that heartbeat itself with a masked pong to dsh every interval, so dsh never sees a missed heartbeat. Must stay well under 4000ms. `0` disables it. |
 | `DSH_WEB_LOG` | `/root/.dsh-web.log` | Where DSH's output goes; the proxy scrapes the launch token from here. |
 | `DSH_TELEMETRY_DISABLED` | `1` | Any non-empty value opts out of DSH telemetry. |
 
@@ -175,15 +176,21 @@ looks like a reconnect loop:
    **Auto Minify off** for HTML/JS, and a **Cache Rule: Bypass** for the host
    (a cached `/` would serve a page without its session cookie). Leave
    **WebSockets on**, and use **SSL Full (Strict)** if Traefik terminates TLS.
-3. **Expect a reconnect after a long idle period, not a continuous one.**
-   Cloudflare reaps an idle WebSocket after ~100s and DSH sends no pings, so
-   the proxy now sends a WS ping every 30s (`PROXY_WS_PING_INTERVAL_MS`).
-   If the UI reconnects *immediately and continuously*, it is not the idle
-   timeout — open browser DevTools → Network → WS and check the failure:
-   `403` means the Host is not trusted (`DSH_TRUSTED_HOSTS`), `401` means the
-   launch-token exchange failed (check `docker logs` for `[upstream-token]`),
-   and a `101` that closes at once usually means Traefik/Cloudflare is not
-   forwarding the `Upgrade` headers.
+3. **The continuous reconnect is dsh's own heartbeat, not Cloudflare's idle
+   timeout.** dsh's realtime server pings every 2s and *terminates the socket
+   after 2 missed pongs* — an idle UI dies in ~6s whenever the ping→pong
+   round trip doesn't survive the proxy chain. The proxy now answers that
+   heartbeat itself: it sends a masked pong to dsh every 1.5s
+   (`PROXY_WS_UPSTREAM_PONG_INTERVAL_MS`, `0` disables) on the upstream leg,
+   so dsh never sees a missed heartbeat no matter what Cloudflare does with
+   real ping/pong traffic. The downstream ping every 30s
+   (`PROXY_WS_PING_INTERVAL_MS`) is still there for Cloudflare's ~100s idle
+   reap. If the UI still reconnects, the proxy logs the decisive clue:
+   `ws close /api/remote.mux after Ns` — ~6s means the heartbeat kill,
+   ~100s means an idle timeout, ~0s or no `ws upstream open` means the
+   handshake itself failed (check `DSH_TRUSTED_HOSTS` on a `403`, the
+   launch-token exchange on a `401`, and the `Upgrade` headers on a `101`
+   that closes at once).
 
 ## Security notes
 

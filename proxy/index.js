@@ -227,6 +227,56 @@ proxy.on('error', (err, req, res) => {
   }
 });
 
+// Upstream WebSocket keepalive (DSH server-side heartbeat fix).
+//
+// The dsh mux server pings every 2s and TERMINATES the socket after 2 missed
+// pongs (~4-6s of silence). An idle UI sends nothing, so the socket survives
+// only if ping -> pong round-trips through every proxy in the path -- and
+// behind Cloudflare it evidently does not: the network capture shows the
+// client reconnecting every few seconds, not every ~100s as a Cloudflare idle
+// timeout would. The proxy's own downstream ping every 30s is far too slow
+// for a 2s x 2 heartbeat, so it cannot save the socket.
+//
+// The proxy is the only hop that can fix this without touching upstream: on
+// the upstream leg it writes a masked empty pong frame (FIN + opcode 10,
+// masked -- this side is the client to dsh) every
+// PROXY_WS_UPSTREAM_PONG_INTERVAL_MS. dsh's `ws` server counts ANY pong as
+// alive, solicited or not, so the server never reaches 2 missed heartbeats
+// no matter what Cloudflare does with the real ping/pong traffic. Default
+// 1500ms -- inside the 2s heartbeat window with margin. Set to 0 to disable.
+const WS_UPSTREAM_PONG_INTERVAL_MS = Number(process.env.PROXY_WS_UPSTREAM_PONG_INTERVAL_MS || '1500');
+
+function startUpstreamKeepalive(upstreamSocket) {
+  if (!WS_UPSTREAM_PONG_INTERVAL_MS || WS_UPSTREAM_PONG_INTERVAL_MS <= 0) return () => {};
+  const timer = setInterval(() => {
+    if (upstreamSocket.destroyed || !upstreamSocket.writable) {
+      clearInterval(timer);
+      return;
+    }
+    try {
+      // Masked empty pong: 0x8A (FIN + pong), 0x80 (MASK set, length 0), then
+      // a fresh 4-byte mask. Client -> server frames MUST be masked
+      // (RFC 6455); an unmasked frame makes `ws` fail the connection with
+      // 1002. Empty payload means there is nothing to mask.
+      upstreamSocket.write(Buffer.concat([Buffer.from([0x8a, 0x80]), crypto.randomBytes(4)]));
+    } catch {
+      clearInterval(timer);
+    }
+  }, WS_UPSTREAM_PONG_INTERVAL_MS);
+  if (typeof timer.unref === 'function') timer.unref();
+  const stop = () => clearInterval(timer);
+  upstreamSocket.on('close', stop);
+  upstreamSocket.on('error', stop);
+  return stop;
+}
+
+// Fires when http-proxy has established the upstream WebSocket (101 already
+// sent, sockets piped). The argument is the socket to dsh, not the client.
+proxy.on('open', (proxySocket) => {
+  console.log('[proxy] ws upstream open');
+  startUpstreamKeepalive(proxySocket);
+});
+
 // WebSocket heartbeat (Cloudflare idle-timeout fix).
 //
 // DSH's realtime channel sends no ping frames, so an idle WebSocket has no
@@ -345,6 +395,14 @@ server.on('upgrade', (req, socket, head) => {
   // startWsHeartbeat above. Without this an idle channel is reaped after
   // ~100s and the UI reconnects in a loop.
   startWsHeartbeat(socket);
+  // Log the socket lifetime: a socket that keeps dying after ~6s is dsh's
+  // 2s x 2 server-side heartbeat firing (see the upstream keepalive above),
+  // while one dying after ~100s is a proxy idle timeout. Either way the
+  // number, not a guess, says which timeout owns the reconnect loop.
+  const wsStartedAt = Date.now();
+  socket.on('close', () => {
+    console.log(`[proxy] ws close ${requestPathname(req.url)} after ${((Date.now() - wsStartedAt) / 1000).toFixed(1)}s`);
+  });
 });
 
 server.listen(LISTEN_PORT, LISTEN_HOST, () => {
