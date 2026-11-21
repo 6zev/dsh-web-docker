@@ -190,7 +190,13 @@ looks like a reconnect loop:
    ~100s means an idle timeout, ~0s or no `ws upstream open` means the
    handshake itself failed (check `DSH_TRUSTED_HOSTS` on a `403`, the
    launch-token exchange on a `401`, and the `Upgrade` headers on a `101`
-   that closes at once).
+   that closes at once). The line also says how the socket ended: a
+   `ws close-frame browser code <n>` / `ws close-frame dsh code <n>` line
+   just before it names who closed the connection and with what code (1000
+   clean, 1001 going away, 1011 server error); `no close frame from
+   browser` means the TCP connection vanished mid-flight with no WS close
+   handshake — the 1006 case, i.e. something between the browser and the
+   origin (Cloudflare, Traefik, or the network itself) cut it.
 
 ## Security notes
 

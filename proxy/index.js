@@ -270,10 +270,90 @@ function startUpstreamKeepalive(upstreamSocket) {
   return stop;
 }
 
+// Passive WebSocket close-frame tap (diagnostic).
+//
+// The socket-lifetime log says WHEN a mux socket dies, not WHY. The why is
+// in the WS close handshake: a close frame carries a code (1000 clean,
+// 1001 going away, 1011 server error) and which side sent it, while NO
+// close frame at all means the TCP connection just vanished (the 1006 case:
+// Cloudflare/Traefik killing the connection, the phone's network changing,
+// the tab being suspended). A raw TCP socket has no close code, so this tap
+// watches the byte stream for opcode-8 frames without touching it: it only
+// listens to 'data', never writes or pauses, and control frames are never
+// compressed (RFC 6455), so permessage-deflate cannot hide them. Client
+// frames are masked and are unmasked here before reading the code.
+function watchWsClose(socket, direction) {
+  let buf = Buffer.alloc(0);
+  let skip = 0;
+  let seen = false;
+  socket.on('data', (chunk) => {
+    if (seen) return;
+    if (skip > 0) {
+      const drop = Math.min(skip, chunk.length);
+      skip -= drop;
+      chunk = chunk.subarray(drop);
+      if (chunk.length === 0) return;
+    }
+    buf = Buffer.concat([buf, chunk]);
+    while (buf.length >= 2 && !seen) {
+      const opcode = buf[0] & 0x0f;
+      const masked = (buf[1] & 0x80) !== 0;
+      let len = buf[1] & 0x7f;
+      let hlen = 2;
+      if (len === 126) {
+        if (buf.length < 4) break;
+        len = buf.readUInt16BE(2);
+        hlen = 4;
+      } else if (len === 127) {
+        if (buf.length < 10) break;
+        len = Number(buf.readBigUInt64BE(2));
+        hlen = 10;
+      }
+      if (masked) hlen += 4;
+      const total = hlen + len;
+      if (buf.length < total) {
+        if (opcode === 8) break; // partial close frame: wait for the rest
+        skip = total - buf.length; // partial data frame: drop the remainder
+        buf = Buffer.alloc(0);
+        break;
+      }
+      if (opcode === 8) {
+        seen = true;
+        let code = null;
+        let reason = '';
+        if (len >= 2) {
+          let payload = buf.subarray(hlen, total);
+          if (masked) {
+            const mask = buf.subarray(hlen - 4, hlen);
+            payload = Buffer.from(payload);
+            for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i % 4];
+          }
+          code = payload.readUInt16BE(0);
+          reason = payload.subarray(2).toString('utf8');
+        }
+        console.log(
+          `[proxy] ws close-frame ${direction} code ${code}` +
+            (reason ? ` ${JSON.stringify(reason)}` : ''),
+        );
+      }
+      buf = buf.subarray(total);
+    }
+  });
+  socket.on('error', (err) => {
+    console.log(`[proxy] ws socket error ${direction}: ${err && err.message}`);
+  });
+  return {
+    get seen() {
+      return seen;
+    },
+  };
+}
+
 // Fires when http-proxy has established the upstream WebSocket (101 already
 // sent, sockets piped). The argument is the socket to dsh, not the client.
 proxy.on('open', (proxySocket) => {
   console.log('[proxy] ws upstream open');
+  watchWsClose(proxySocket, 'dsh');
   startUpstreamKeepalive(proxySocket);
 });
 
@@ -391,17 +471,28 @@ server.on('upgrade', (req, socket, head) => {
     return;
   }
   proxy.ws(req, socket, head);
+  // Tap the browser-side byte stream for close frames, so the close log
+  // below can say who closed and with what code (or that no close frame
+  // arrived at all, i.e. the connection was killed mid-flight).
+  const browserClose = watchWsClose(socket, 'browser');
   // Keep the WebSocket alive through Cloudflare/Traefik idle timeouts; see
   // startWsHeartbeat above. Without this an idle channel is reaped after
   // ~100s and the UI reconnects in a loop.
   startWsHeartbeat(socket);
-  // Log the socket lifetime: a socket that keeps dying after ~6s is dsh's
-  // 2s x 2 server-side heartbeat firing (see the upstream keepalive above),
-  // while one dying after ~100s is a proxy idle timeout. Either way the
-  // number, not a guess, says which timeout owns the reconnect loop.
+  // Log the socket lifetime and how it ended: a socket that keeps dying
+  // after ~6s is dsh's 2s x 2 server-side heartbeat firing (see the
+  // upstream keepalive above), while one dying after ~100s is a proxy idle
+  // timeout. Either way the number, not a guess, says which timeout owns
+  // the reconnect loop. The close-frame lines logged just before this one
+  // say who closed it; no close frame means the transport vanished
+  // (Cloudflare/Traefik cut the connection, or the network changed).
   const wsStartedAt = Date.now();
-  socket.on('close', () => {
-    console.log(`[proxy] ws close ${requestPathname(req.url)} after ${((Date.now() - wsStartedAt) / 1000).toFixed(1)}s`);
+  socket.on('close', (hadError) => {
+    console.log(
+      `[proxy] ws close ${requestPathname(req.url)} after ${((Date.now() - wsStartedAt) / 1000).toFixed(1)}s` +
+        (browserClose.seen ? ' (browser sent a close frame)' : ' (no close frame from browser)') +
+        (hadError ? ' [socket error]' : ''),
+    );
   });
 });
 
