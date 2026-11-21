@@ -28,7 +28,7 @@ FROM ${NODE_IMAGE} AS dsh-builder
 ARG DSH_VERSION
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl python3 make g++ unzip \
+    && apt-get install -y --no-install-recommends ca-certificates curl python3 make g++ unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Fail loudly if the version does not exist rather than building something
@@ -47,7 +47,9 @@ RUN npm install -g --no-audit --no-fund pnpm
 # bun via the official installer, not `npm i -g bun`: a single binary, no npm
 # wrapper or cache. BUN_INSTALL=/usr/local puts it at /usr/local/bin/bun, so
 # the COPY below carries it into the runtime stage with nothing else.
-# (The installer needs curl + unzip, added to the builder apt list above.)
+# (The installer needs curl + unzip + ca-certificates for TLS, added to the
+# builder apt list above. node:24-slim ships no CA bundle, so curl fails
+# with error 77 without it.)
 RUN curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash \
     && bun --version
 
