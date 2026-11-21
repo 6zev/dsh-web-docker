@@ -4,6 +4,30 @@ name: build
 #
 # The verify step is not decorative: a build that produces an image which cannot
 # serve the UI is worse than no image, because it looks fine in the registry.
+#
+# ---------------------------------------------------------------------------
+# Why matrix + native runners, not one multi-arch build
+# ---------------------------------------------------------------------------
+# The old shape was a single job that built linux/amd64+linux/arm64 in one
+# buildx invocation on one ubuntu-latest runner. Buildx does run the platforms
+# concurrently, but they share the same 4 vCPUs — and the arm64 leg runs under
+# QEMU emulation, which is CPU-hungry (node-pty compiles from source on Linux).
+# Wall time was therefore close to the sum of the two legs (~16 min).
+#
+# Now each platform gets its own runner and builds in parallel:
+#   amd64 -> ubuntu-latest (native)
+#   arm64 -> ubuntu-24.04-arm (native, no QEMU at all)
+# Wall time becomes roughly the slower leg instead of the sum.
+#
+# That shape forces push-by-digest: each build job pushes its own platform
+# image by digest, and a merge job then assembles the multi-arch manifest
+# (dsh-<version>, dsh-<version>-<sha>, :latest) with `buildx imagetools
+# create`. Nothing is tagged :latest until both platforms passed the smoke
+# test, so a bad amd64 build can never ship alongside a good arm64 one.
+#
+# The smoke test still runs before any push: each build job builds the image
+# locally (load: true), runs scripts/smoke-test.sh against it, and only then
+# rebuilds from cache and pushes by digest.
 
 on:
   workflow_dispatch:
@@ -12,10 +36,6 @@ on:
         description: "npm version of @deepseek-ai/dsh (empty = resolve dist-tags.latest)"
         required: false
         default: ""
-      platforms:
-        description: "Comma-separated target platforms"
-        required: true
-        default: "linux/amd64,linux/arm64"
   push:
     branches:
       - main
@@ -52,13 +72,17 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  # inputs.* is empty outside workflow_dispatch, so give the values that other
-  # triggers rely on an explicit fallback here rather than relying on `||`.
-  PLATFORMS: ${{ inputs.platforms || 'linux/amd64,linux/arm64' }}
 
 jobs:
-  build:
+  # Resolve the DSH version once and decide whether a scheduled run is a no-op,
+  # so both platform jobs agree on the version instead of each resolving npm
+  # latest independently (upstream could publish mid-run).
+  prep:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+      skip: ${{ steps.check.outputs.skip }}
     steps:
       - uses: actions/checkout@v4
 
@@ -99,8 +123,6 @@ jobs:
       # makes the tag useless for "what changed".
       - name: Check whether this version is already published
         id: check
-        env:
-          REQUESTED_VERSION: ${{ inputs.dsh_version }}
         run: |
           set -euo pipefail
           version="${{ steps.version.outputs.version }}"
@@ -135,36 +157,129 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Set up QEMU
-        if: steps.check.outputs.skip != 'true'
-        uses: docker/setup-qemu-action@v3
+      - name: Summary (skipped)
+        if: steps.check.outputs.skip == 'true'
+        run: |
+          {
+            echo "### dsh-web build"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| DSH version | \`${{ steps.version.outputs.version }}\` |"
+            echo "| Result | skipped — \`dsh-${{ steps.version.outputs.version }}\` already published |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
+  build:
+    needs: prep
+    if: needs.prep.outputs.skip != 'true'
+    strategy:
+      # One platform failing must not kill the other leg's logs/diagnostics.
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # No QEMU setup: each leg runs natively on its own architecture.
       - name: Set up Buildx
-        if: steps.check.outputs.skip != 'true'
         uses: docker/setup-buildx-action@v3
 
-      # Build and load amd64 only first: this is what the smoke test runs against.
-      - name: Build amd64 for verification
-        if: steps.check.outputs.skip != 'true'
+      # Build this platform only, load it locally, and smoke-test it before
+      # anything reaches the registry.
+      - name: Build ${{ matrix.platform }} for verification
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64
+          platforms: ${{ matrix.platform }}
           load: true
           tags: dsh-web:verify
           build-args: |
-            DSH_VERSION=${{ steps.version.outputs.version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            DSH_VERSION=${{ needs.prep.outputs.version }}
+          # Per-platform cache scope: an amd64 layer cache must never be
+          # restored into an arm64 build (or vice versa).
+          cache-from: type=gha,scope=build-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=build-${{ matrix.arch }}
 
       - name: Smoke test
-        if: steps.check.outputs.skip != 'true'
         run: |
           chmod +x scripts/smoke-test.sh
           IMAGE=dsh-web:verify ./scripts/smoke-test.sh
 
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request' && steps.check.outputs.skip != 'true'
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Push by digest only (no tags here — the merge job owns the tags).
+      # The layer cache from the verify build makes this second build cheap:
+      # it reuses every layer and only pushes.
+      - name: Build and push ${{ matrix.platform }} by digest
+        id: build-push
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: true
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            DSH_VERSION=${{ needs.prep.outputs.version }}
+          cache-from: type=gha,scope=build-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=build-${{ matrix.arch }}
+
+      # The digest is the merge job's only input: one file per platform,
+      # named after the digest hash, uploaded as an artifact.
+      - name: Record digest
+        if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.build-push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest="${DIGEST#sha256:}"
+          if [ -z "$digest" ]; then
+            echo "no digest from the push step" >&2
+            exit 1
+          fi
+          touch "/tmp/digests/${digest}"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Assemble the multi-arch manifest from the per-platform digests and tag it.
+  # Runs only after both platform jobs passed (needs: build) and never on PRs.
+  merge:
+    needs: [prep, build]
+    if: github.event_name != 'pull_request' && needs.prep.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -172,34 +287,30 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Tags: always publish the version-anchored tag, commit tag, and :latest.
-      - name: Compute tags
-        id: tags
-        if: github.event_name != 'pull_request' && steps.check.outputs.skip != 'true'
+      - name: Create multi-arch manifest and tag it
         run: |
           set -euo pipefail
           image="${REGISTRY}/${IMAGE_NAME}"
-          version="${{ steps.version.outputs.version }}"
+          version="${{ needs.prep.outputs.version }}"
           short_sha="$(echo "${GITHUB_SHA}" | cut -c1-7)"
 
-          tags="${image}:dsh-${version}"
-          tags="${tags},${image}:dsh-${version}-${short_sha}"
-          tags="${tags},${image}:latest"
+          digests=""
+          for file in /tmp/digests/*; do
+            [ -f "$file" ] || continue
+            digests="${digests} ${image}@sha256:$(basename "$file")"
+          done
+          if [ -z "$digests" ]; then
+            echo "no platform digests found under /tmp/digests" >&2
+            exit 1
+          fi
 
-          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
-          echo "publishing: ${tags}"
-
-      - name: Build and push multi-arch
-        if: github.event_name != 'pull_request' && steps.check.outputs.skip != 'true'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: ${{ env.PLATFORMS }}
-          push: true
-          tags: ${{ steps.tags.outputs.tags }}
-          build-args: |
-            DSH_VERSION=${{ steps.version.outputs.version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          echo "publishing: ${image}:dsh-${version}, ${image}:dsh-${version}-${short_sha}, ${image}:latest"
+          echo "from:${digests}"
+          docker buildx imagetools create \
+            -t "${image}:dsh-${version}" \
+            -t "${image}:dsh-${version}-${short_sha}" \
+            -t "${image}:latest" \
+            $digests
 
       - name: Summary
         run: |
@@ -208,12 +319,8 @@ jobs:
             echo ""
             echo "| | |"
             echo "|---|---|"
-            echo "| DSH version | \`${{ steps.version.outputs.version }}\` |"
-            if [ "${{ steps.check.outputs.skip }}" = "true" ]; then
-              echo "| Result | skipped — \`dsh-${{ steps.version.outputs.version }}\` already published |"
-            else
-              echo "| Pre-release | ${{ steps.version.outputs.is_prerelease }} |"
-              echo "| Platforms | \`${PLATFORMS}\` |"
-              echo "| Smoke test | passed |"
-            fi
+            echo "| DSH version | \`${{ needs.prep.outputs.version }}\` |"
+            echo "| Pre-release | ${{ needs.prep.outputs.is_prerelease }} |"
+            echo "| Platforms | \`linux/amd64,linux/arm64\` (matrix, native runners) |"
+            echo "| Smoke test | passed (both platforms) |"
           } >> "$GITHUB_STEP_SUMMARY"
