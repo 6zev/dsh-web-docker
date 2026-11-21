@@ -28,7 +28,7 @@ FROM ${NODE_IMAGE} AS dsh-builder
 ARG DSH_VERSION
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 make g++ \
+    && apt-get install -y --no-install-recommends curl python3 make g++ unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Fail loudly if the version does not exist rather than building something
@@ -44,6 +44,13 @@ RUN node -p "'APP_VERSION=' + require('/usr/local/lib/node_modules/@deepseek-ai/
 # the runtime stage, so the final image carries the binary but not the cache.
 RUN npm install -g --no-audit --no-fund pnpm
 
+# bun via the official installer, not `npm i -g bun`: a single binary, no npm
+# wrapper or cache. BUN_INSTALL=/usr/local puts it at /usr/local/bin/bun, so
+# the COPY below carries it into the runtime stage with nothing else.
+# (The installer needs curl + unzip, added to the builder apt list above.)
+RUN curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash \
+    && bun --version
+
 # ── Stage 2: runtime ──────────────────────────────────────────────────────
 FROM ${NODE_IMAGE}
 
@@ -52,7 +59,7 @@ ARG DSH_VERSION
 LABEL org.opencontainers.image.title="dsh-web" \
       org.opencontainers.image.description="DeepSeek Harness Web with loopback bypass proxy"
 
-# Node 24, DSH, compiled node-pty, and pnpm all live under /usr/local.
+# Node 24, DSH, compiled node-pty, pnpm, and bun all live under /usr/local.
 COPY --from=dsh-builder /usr/local/ /usr/local/
 COPY --from=dsh-builder /tmp/app_version.env /etc/dsh-version
 
@@ -90,7 +97,8 @@ RUN apt-get update \
     && jq --version \
     && python3 --version \
     && make --version | head -1 \
-    && g++ --version | head -1
+    && g++ --version | head -1 \
+    && bun --version
 
 # The container runs as root by design, and Chromium refuses to start as root
 # without --no-sandbox. Debian's /usr/bin/chromium wrapper resets CHROMIUM_FLAGS
